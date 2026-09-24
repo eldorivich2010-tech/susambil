@@ -827,6 +827,10 @@ async def leave_start(message: Message, state: FSMContext):
         return
 
     await state.set_state(LeaveFlow.location)
+    # Eski (masalan, "Keldim" paytida boshlangan va hali tugamagan) jonli
+    # joylashuvning navbatdagi yangilanishi "Ketyapman" uchun ham hisoblanib
+    # ketmasligi uchun — qaysi xabar ketish uchun kutilayotganini tozalaymiz.
+    await state.update_data(leave_msg_id=None)
     await message.answer(
         "🏠 <b>Ketyapman — joylashuvni yuboring</b>\n"
         f"{LINE}\n"
@@ -874,6 +878,13 @@ async def handle_leave_location(message: Message, state: FSMContext, is_update: 
             return
         await message.answer(problem, reply_markup=LEAVE_KB)
         return
+
+    if not is_update:
+        # Shu (yangi boshlangan) jonli joylashuv xabarining ID'sini eslab
+        # qolamiz — pastdagi edited_message handler faqat shu ID'ga tegishli
+        # yangilanishlarni qabul qiladi, boshqa (masalan, eski "Keldim"
+        # jonli joylashuvidan qolgan) yangilanishlarni emas.
+        await state.update_data(leave_msg_id=message.message_id)
 
     real_dist, tolerance, dist = location_check(message.location)
     radius = get_radius()
@@ -1169,7 +1180,18 @@ async def handle_leave_location_update(message: Message, state: FSMContext):
     emas). Ilgari bot faqat birinchi joylashuvni ko'rar edi — agar o'sha lahzada
     GPS hali aniq bo'lmasa (masalan bino ichida), ishchi qayta "🏠 Ketyapman"ni
     bosib joylashuvni qaytadan boshlashi kerak edi. Endi har bir yangilanishda
-    qayta tekshiriladi — GPS to'g'rilanishi bilanoq avtomatik qabul qilinadi."""
+    qayta tekshiriladi — GPS to'g'rilanishi bilanoq avtomatik qabul qilinadi.
+
+    MUHIM: bu yangilanish faqat ANIQ SHU "Ketyapman" urinishida yuborilgan
+    joylashuv xabariga tegishli bo'lishi kerak. Aks holda, agar ishchining
+    "Keldim" paytida boshlagan jonli joylashuvi hali tugamagan (masalan,
+    bir necha soatga ulashgan) bo'lsa, o'sha eski ulashuvning navbatdagi
+    yangilanishi bu yerga tushib, ishchi hech narsa yubormasdan turib
+    "Ketyapman" avtomatik bajarilib ketardi — foydalanuvchiga xuddi tugma
+    bosilishi bilan darhol "Xayr" deyilayotgandek tuyulardi."""
+    data = await state.get_data()
+    if data.get("leave_msg_id") != message.message_id:
+        return
     await handle_leave_location(message, state, is_update=True)
 
 
