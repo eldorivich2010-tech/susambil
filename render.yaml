@@ -1,0 +1,28 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Shu fayl orqali Render'da "New → Blueprint" bilan bir bosishda deploy
+# qilish mumkin.
+#
+# Bu bot Telegram uzun polling bilan ishlaydi (serverni HTTP so'rov
+# kutmaydi), shuning uchun Render'da "Background Worker" turi ishlatiladi.
+#
+# BOT_TOKEN config.py ichiga yoziladi (Environment'da kerak emas).
+
+services:
+  - type: worker
+    name: employee-attendance-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+    # Davomat tarixi (SQLite baza) qayta deploy'da yo'qolmasligi uchun
+    # disk ulash mumkin. Ulashda config env'iga quyidagini qo'shing:
+    #   DB_PATH=/data/attendance.db
+    # (Pullik rejim talab qiladi — bepul rejimda bu blokni olib tashlang)
+    #
+    # disk:
+    #   name: bot-data
+    #   mountPath: /data
+    #   sizeGB: 1
