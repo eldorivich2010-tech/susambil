@@ -66,6 +66,13 @@ from config import (
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo(TIMEZONE)
 
+# DB_PATH Railway Volume kabi alohida papkaga (masalan /data) ko'rsatilganda,
+# sqlite3.connect() o'zi papkani yaratib bermaydi — mavjud bo'lmasa "unable to
+# open database file" xatosini beradi. Shu sabab papkani oldindan yaratamiz.
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
