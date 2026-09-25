@@ -5,7 +5,10 @@
 # Bu bot Telegram uzun polling bilan ishlaydi (serverni HTTP so'rov
 # kutmaydi), shuning uchun Render'da "Background Worker" turi ishlatiladi.
 #
-# BOT_TOKEN config.py ichiga yoziladi (Environment'da kerak emas).
+# BOT_TOKEN endi Environment'dan o'qiladi (config.py ichida yozilmaydi) —
+# Render panelida bu servisga BOT_TOKEN nomli environment variable qo'shing.
+# (Railway'da ishlatilsa — bu fayl shart emas, u yerda Variables bo'limiga
+# qo'shiladi.)
 
 services:
   - type: worker
@@ -17,6 +20,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
+      - key: BOT_TOKEN
+        sync: false
     # Davomat tarixi (SQLite baza) qayta deploy'da yo'qolmasligi uchun
     # disk ulash mumkin. Ulashda config env'iga quyidagini qo'shing:
     #   DB_PATH=/data/attendance.db

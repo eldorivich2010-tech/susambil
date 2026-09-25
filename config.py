@@ -1,21 +1,27 @@
 # =========================================================
 #  BOT SOZLAMALARI
 #
-#  BOT_TOKEN ni pastda to'g'ridan-to'g'ri shu faylga yozasiz.
-#  DIQQAT: token yozilgan config.py ni ochiq (public) repoga
-#  yuklamang — token ochilib qoladi. Repo private bo'lsin.
+#  BOT_TOKEN endi shu faylga yozilmaydi — Railway'dagi "Variables"
+#  bo'limidan o'qiladi. Bu tokenni GitHub'ga (hatto private repoga
+#  ham) tasodifan yuklab qo'yishning oldini oladi.
+#
+#  Railway'da: loyihangiz -> Variables -> "New Variable" ->
+#    Name:  BOT_TOKEN
+#    Value: @BotFather'dan olgan tokeningiz
+#  Kompyuterda mahalliy sinash uchun esa muhit o'zgaruvchisini
+#  o'zingiz belgilang (masalan PowerShell'da: $env:BOT_TOKEN="...").
 # =========================================================
 
 import os
 
-# @BotFather'dan olingan bot tokeni — shu yerga qo'shtirnoq ichiga yozing:
-BOT_TOKEN = "8888788104:AAG40_WJ0cKOy7z7vsmFJ0tAw1zTeKCRXMQ"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-if BOT_TOKEN == "BU_YERGA_TOKENNI_YOZING":
+if not BOT_TOKEN:
     raise RuntimeError(
-        "BOT_TOKEN yozilmagan!\n"
-        "config.py faylini oching va BOT_TOKEN = \"...\" qatoriga "
-        "@BotFather'dan olgan tokeningizni yozing."
+        "BOT_TOKEN muhit o'zgaruvchisi topilmadi!\n"
+        "Railway'da: loyiha -> Variables -> New Variable -> "
+        "Name=BOT_TOKEN, Value=@BotFather'dan olgan tokeningiz.\n"
+        "Mahalliy sinashda: $env:BOT_TOKEN=\"tokeningiz\" (PowerShell)."
     )
 
 # Xabarlar yuboriladigan guruh IDsi (odatda manfiy son, masalan -1001234567890)
