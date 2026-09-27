@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime ma'lumotlar bazasi (Railway'da o'zi yaratiladi)
+attendance.db
+
+# Muharrir / vosita fayllari
+.claude/
+.vscode/
+.idea/
