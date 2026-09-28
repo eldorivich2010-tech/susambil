@@ -6,14 +6,15 @@ Fayl tuzilishi (bo'limlar):
   2. YORDAMCHI FUNKSIYALAR — masofa, vaqt formati, admin tekshiruvi
   3. KLAVIATURALAR — tugmalar
   4. /START — hamma uchun kirish nuqtasi
-  5. ISHCHI QISMI — keldim va ketyapman (jonli joylashuv bilan), statistika, bonus/jazolarim
+  5. ISHCHI QISMI — keldim va ketyapman (jonli joylashuv bilan), statistika, bonus/jarimalarim
   6. ADMIN PANELI — tugmalar orqali boshqarish (qadam-baqadam)
-  7. PDF HISOBOT — davomat + bonus/jazo sabablari bilan
+  7. PDF HISOBOT — davomat + bonus/jarima sabablari va summalari bilan
   8. ADMIN BUYRUQLARI — eski matnli buyruqlar (ixtiyoriy)
   9. ISHGA TUSHIRISH
 """
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -74,7 +75,12 @@ BTN_ARRIVE = "✅ Keldim"
 BTN_LEAVE = "🏠 Ketyapman"
 BTN_BACK = "↩️ Orqaga"
 BTN_STATS = "📊 Statistikam"
-BTN_MARKS = "🏅 Bonus va jazolarim"
+BTN_MARKS = "🏅 Bonus va jarimalarim"
+BTN_GIVE_FINE = "💸 Jarima berish"
+# "Jazo" endi "jarima" deb nomlangan. Telefonlarda eski klaviatura qolib ketgan bo'lsa
+# ham tugmalar ishlashi uchun eski yozuvlarni ham qabul qilamiz.
+LEGACY_BTN_MARKS = "🏅 Bonus va jazolarim"
+LEGACY_BTN_GIVE_FINE = "⚠️ Jazo berish"
 BTN_FINES = "💰 Jarima sozlamalari"
 BTN_TODAY = "📅 Bugungi davomat"
 
@@ -96,8 +102,8 @@ WEEKDAYS = [
 # Yangi ishchi qo'shilganda beriladigan standart ketish vaqti
 DEFAULT_DEPARTURE = "18:00"
 
-# Jazo uchun tayyor sabablar — admin ro'yxatdan tanlaydi
-JAZO_REASONS = [
+# Jarima uchun tayyor sabablar — admin ro'yxatdan tanlaydi (yoki o'zi yozadi)
+FINE_REASONS = [
     "Rangli ichimlik yoki xidli mahsulot iste'mol qilish",
     "Uniforma kiymaganligi",
     "Ish vaqtida mobil qurilmalardan foydalanish",
@@ -170,15 +176,16 @@ def init_db():
                 FOREIGN KEY (worker_id) REFERENCES workers (id)
             );
 
-            -- Bonus, jazo va ogohlantirishlar
+            -- Bonus, jarima va ogohlantirishlar
             CREATE TABLE IF NOT EXISTS marks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 worker_id INTEGER NOT NULL,
-                mark_type TEXT NOT NULL,      -- 'bonus', 'jazo' yoki 'ogohlantirish'
+                mark_type TEXT NOT NULL,      -- 'bonus', 'jarima' yoki 'ogohlantirish'
                 reason TEXT NOT NULL,
                 mark_date TEXT NOT NULL,      -- 'YYYY-MM-DD'
                 created_at TEXT NOT NULL,     -- 'HH:MM:SS'
                 admin_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL DEFAULT 0,  -- jarima summasi (so'mda)
                 FOREIGN KEY (worker_id) REFERENCES workers (id)
             );
             CREATE INDEX IF NOT EXISTS idx_marks_worker_date
@@ -192,6 +199,13 @@ def init_db():
             );
             """
         )
+        # Eski bazalar uchun: marks jadvaliga jarima summasi ustunini qo'shamiz
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(marks)")}
+        if "amount" not in columns:
+            conn.execute("ALTER TABLE marks ADD COLUMN amount INTEGER NOT NULL DEFAULT 0")
+        # "Jazo" va "jarima" endi bitta tushuncha: eski jazo yozuvlari jarima bo'ldi
+        # (ularning summasi o'sha paytda kiritilmagan, shuning uchun 0 bo'lib qoladi)
+        conn.execute("UPDATE marks SET mark_type = 'jarima' WHERE mark_type = 'jazo'")
         conn.commit()
 
 
@@ -365,20 +379,23 @@ def times_for_day(worker, when: datetime) -> tuple[str | None, str | None]:
     return worker[4], worker[5]
 
 
-# ---------- Bonus va jazolar ----------
+# ---------- Bonus va jarimalar ----------
 
-def add_mark(worker_id: int, mark_type: str, reason: str, admin_id: int):
+def add_mark(
+    worker_id: int, mark_type: str, reason: str, admin_id: int, amount: int = 0,
+):
     now = datetime.now(TZ)
     db(
-        "INSERT INTO marks (worker_id, mark_type, reason, mark_date, created_at, admin_id) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO marks "
+        "(worker_id, mark_type, reason, mark_date, created_at, admin_id, amount) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (worker_id, mark_type, reason, now.date().isoformat(),
-         now.strftime("%H:%M:%S"), admin_id),
+         now.strftime("%H:%M:%S"), admin_id, amount),
     )
 
 
 def count_marks(worker_id: int, mark_type: str) -> int:
-    """Ishchining shu turdagi (bonus/jazo/ogohlantirish) yozuvlari soni."""
+    """Ishchining shu turdagi (bonus/jarima/ogohlantirish) yozuvlari soni."""
     return db(
         "SELECT COUNT(*) FROM marks WHERE worker_id = ? AND mark_type = ?",
         (worker_id, mark_type), fetch="one",
@@ -386,13 +403,68 @@ def count_marks(worker_id: int, mark_type: str) -> int:
 
 
 def get_marks(worker_id: int, date_from=None, date_to=None):
-    """(turi, sabab, sana) ro'yxati — eng yangisi birinchi."""
-    query = "SELECT mark_type, reason, mark_date FROM marks WHERE worker_id = ?"
+    """(turi, sabab, sana, summa) ro'yxati — eng yangisi birinchi."""
+    query = "SELECT mark_type, reason, mark_date, amount FROM marks WHERE worker_id = ?"
     params: list = [worker_id]
     if date_from and date_to:
         query += " AND mark_date BETWEEN ? AND ?"
         params += [date_from.isoformat(), date_to.isoformat()]
     return db(query + " ORDER BY mark_date DESC, id DESC", tuple(params), fetch="all")
+
+
+def late_fine_reason(
+    scheduled: str | None, arrived: str, early_min: int, late_min: int,
+) -> str:
+    """Kechikish jarimasining sababi (ishchiga ko'rsatiladigan matn)."""
+    base = f"Kechikish: belgilangan {scheduled or '—'}, keldi {arrived[:5]}"
+    if late_min:
+        return f"{base} ({format_minutes(late_min)} kech)"
+    return f"{base} (erta kelish oynasida {format_minutes(early_min)})"
+
+
+def collect_fine_entries(worker_id: int, date_from=None, date_to=None) -> list[tuple]:
+    """Ishchining BARCHA jarimalari bitta ro'yxatda: kechikish jarimalari (davomatdan)
+    va admin qo'lda bergan jarimalar. date_from/date_to — date obyektlari (ixtiyoriy).
+
+    Qaytaradi: [(sana, vaqt, sabab, summa, tur)] — eng yangisi birinchi;
+    tur: 'late' (kechikish) yoki 'manual' (admin bergan)."""
+    params: list = [worker_id]
+    date_filter = ""
+    if date_from and date_to:
+        date_filter = " AND {col} BETWEEN ? AND ?"
+        params += [date_from.isoformat(), date_to.isoformat()]
+
+    entries: list[tuple] = []
+    for date, arrived, sched, early_min, late_min, fine in db(
+        "SELECT attendance_date, arrived_time, scheduled_time, early_minutes, "
+        "late_minutes, fine_amount FROM attendance "
+        "WHERE worker_id = ? AND fine_amount > 0" + date_filter.format(col="attendance_date"),
+        tuple(params), fetch="all",
+    ):
+        entries.append((
+            date, arrived, late_fine_reason(sched, arrived, early_min, late_min),
+            fine, "late",
+        ))
+    for date, created, reason, amount in db(
+        "SELECT mark_date, created_at, reason, amount FROM marks "
+        "WHERE worker_id = ? AND mark_type = 'jarima'" + date_filter.format(col="mark_date"),
+        tuple(params), fetch="all",
+    ):
+        entries.append((date, created, reason, amount, "manual"))
+
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return entries
+
+
+def format_fine_list(entries: list[tuple], limit: int = 20) -> str:
+    """Jarimalar ro'yxatini sabab va summa bilan matnga aylantiradi."""
+    lines = []
+    for number, (date, _time, reason, amount, _kind) in enumerate(entries[:limit], 1):
+        money = format_money(amount) if amount else "summa belgilanmagan"
+        lines.append(f"{number}. <b>{date}</b> — {html.escape(reason, quote=False)}\n   💰 {money}")
+    if len(entries) > limit:
+        lines.append(f"… va yana {len(entries) - limit} ta (eskiroqlari)")
+    return "\n".join(lines)
 
 
 def record_attendance(
@@ -518,6 +590,21 @@ def compute_fine(
     return early_min, late_min, total, excessive
 
 
+async def send_long(message: Message, text: str, limit: int = 4000) -> None:
+    """Telegram xabari 4096 belgidan oshmasligi kerak — uzun matnni bloklar
+    (bo'sh qator) bo'yicha bir nechta xabarga bo'lib yuboradi."""
+    chunk = ""
+    for block in text.split("\n\n"):
+        candidate = f"{chunk}\n\n{block}" if chunk else block
+        if chunk and len(candidate) > limit:
+            await message.answer(chunk)
+            chunk = block
+        else:
+            chunk = candidate
+    if chunk:
+        await message.answer(chunk)
+
+
 async def notify_group(bot, text: str) -> None:
     """Guruhga xabar yuboradi. GROUP_CHAT_ID belgilanmagan (0) bo'lsa — jim o'tkazib yuboradi."""
     if not GROUP_CHAT_ID:
@@ -589,7 +676,7 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
         ])
         rows.append([
             KeyboardButton(text="🏅 Bonus berish"),
-            KeyboardButton(text="⚠️ Jazo berish"),
+            KeyboardButton(text=BTN_GIVE_FINE),
         ])
         rows.append([
             KeyboardButton(text="📄 PDF hisobot"),
@@ -648,7 +735,7 @@ REPORT_KB = InlineKeyboardMarkup(
 MARKS_KB = InlineKeyboardMarkup(
     inline_keyboard=[[
         InlineKeyboardButton(text="🏅 Bonuslar", callback_data="my_bonus"),
-        InlineKeyboardButton(text="⚠️ Jazolar", callback_data="my_jazo"),
+        InlineKeyboardButton(text="💸 Jarimalar", callback_data="my_jarima"),
         InlineKeyboardButton(text="🔔 Ogohlantirishlar", callback_data="my_ogoh"),
     ]]
 )
@@ -723,8 +810,8 @@ async def cmd_start(message: Message, state: FSMContext):
             "➕ <b>Ishchi qo'shish</b> — bot hammasini qadam-baqadam so'raydi\n"
             "📋 <b>Ishchilar ro'yxati</b> — vaqt, jadval, o'chirish\n"
             "🏅 <b>Bonus berish</b> — yaxshi ish uchun rahmat\n"
-            "⚠️ <b>Jazo berish</b> — sababni ro'yxatdan tanlaysiz\n"
-            "📄 <b>PDF hisobot</b> — davomat, bonus va jazolar\n"
+            "💸 <b>Jarima berish</b> — sabab tanlanadi yoki yoziladi, keyin summa kiritasiz\n"
+            "📄 <b>PDF hisobot</b> — davomat, bonus va jarimalar\n"
             "📅 <b>Bugungi davomat</b> — kim keldi, kim ketdi, kim hali kelmagan\n"
             "📍 <b>Ish joyi joylashuvi</b> — ish joyi nuqtasi va radius\n"
             f"{BTN_FINES} — kechikish jarimasi summalarini o'zgartirish"
@@ -1167,32 +1254,41 @@ async def handle_stats_callback(callback: CallbackQuery):
         date_from, period_label = today_date.replace(day=1), "Shu oydagi"
 
     records = db(
-        "SELECT is_late, late_minutes, fine_amount FROM attendance "
+        "SELECT is_late, late_minutes FROM attendance "
         "WHERE worker_id = ? AND attendance_date BETWEEN ? AND ?",
         (worker[0], date_from.isoformat(), today_date.isoformat()), fetch="all",
     )
-
     total_days = len(records)
-    late_count = sum(1 for is_late, _, _ in records if is_late)
-    total_late_minutes = sum(m for is_late, m, _ in records if is_late)
-    fined_days = sum(1 for _, _, fine in records if fine)
-    total_fine = sum(fine for _, _, fine in records)
+    late_count = sum(1 for is_late, _ in records if is_late)
+    total_late_minutes = sum(m for is_late, m in records if is_late)
 
-    if total_days == 0:
+    # Kechikish jarimalari + admin bergan jarimalar — sababi va summasi bilan
+    fines = collect_fine_entries(worker[0], date_from, today_date)
+    late_total = sum(f[3] for f in fines if f[4] == "late")
+    manual_total = sum(f[3] for f in fines if f[4] == "manual")
+
+    if total_days == 0 and not fines:
         text = f"📊 <b>{period_label} natijalar</b>\n{LINE}\nBu davrda hali yozuv yo'q 🙈"
     else:
-        text = (
-            f"📊 <b>{period_label} natijalar</b>\n{LINE}\n"
-            f"✅ Kelgan kunlar: <b>{total_days}</b>\n"
-            f"🔴 Kech qolgan kunlar: <b>{late_count}</b>\n"
-        )
-        if late_count:
-            text += f"⏰ Jami kechikish: <b>{format_minutes(total_late_minutes)}</b>\n"
-        if total_fine:
+        text = f"📊 <b>{period_label} natijalar</b>\n{LINE}\n"
+        if total_days:
             text += (
-                f"💰 Jarimali kunlar: <b>{fined_days}</b>\n"
-                f"💰 Jami jarima: <b>{format_money(total_fine)}</b>"
+                f"✅ Kelgan kunlar: <b>{total_days}</b>\n"
+                f"🔴 Kech qolgan kunlar: <b>{late_count}</b>\n"
             )
+            if late_count:
+                text += f"⏰ Jami kechikish: <b>{format_minutes(total_late_minutes)}</b>\n"
+        else:
+            text += "Bu davrda kelish yozuvi yo'q.\n"
+
+        if fines:
+            text += f"💰 Jami jarima: <b>{format_money(late_total + manual_total)}</b>\n"
+            if late_total and manual_total:
+                text += (
+                    f"   • Kechikish uchun: {format_money(late_total)}\n"
+                    f"   • Boshqa jarimalar: {format_money(manual_total)}\n"
+                )
+            text += f"\n💸 <b>Jarimalar ro'yxati</b>\n{LINE}\n{format_fine_list(fines)}"
         else:
             text += "🎉 Jarima yo'q — barakalla!"
 
@@ -1203,9 +1299,9 @@ async def handle_stats_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- Ishchining bonus va jazolari ----------
+# ---------- Ishchining bonus va jarimalari ----------
 
-@worker_router.message(F.text == BTN_MARKS)
+@worker_router.message(F.text.in_({BTN_MARKS, LEGACY_BTN_MARKS}))
 async def handle_my_marks(message: Message):
     worker = get_worker(message.from_user.id)
     if not worker:
@@ -1213,44 +1309,61 @@ async def handle_my_marks(message: Message):
         return
 
     marks = get_marks(worker[0])
-    bonus_count = sum(1 for mark_type, _, _ in marks if mark_type == "bonus")
-    jazo_count = sum(1 for mark_type, _, _ in marks if mark_type == "jazo")
-    ogoh_count = sum(1 for mark_type, _, _ in marks if mark_type == "ogohlantirish")
+    bonus_count = sum(1 for mark in marks if mark[0] == "bonus")
+    ogoh_count = sum(1 for mark in marks if mark[0] == "ogohlantirish")
+    fines = collect_fine_entries(worker[0])  # kechikish + admin bergan jarimalar
+    fine_total = sum(f[3] for f in fines)
 
-    await message.answer(
-        f"🏅 <b>Bonus va jazolarim</b>\n{LINE}\n"
+    text = (
+        f"🏅 <b>Bonus va jarimalarim</b>\n{LINE}\n"
         f"🏅 Bonuslar: <b>{bonus_count}</b> ta\n"
-        f"⚠️ Jazolar: <b>{jazo_count}</b> ta\n"
-        f"🔔 Ogohlantirishlar: <b>{ogoh_count}</b> ta\n\n"
-        "Batafsil ko'rish uchun tugmani bosing 👇",
-        reply_markup=MARKS_KB,
+        f"💸 Jarimalar: <b>{len(fines)}</b> ta"
     )
+    if fine_total:
+        text += f" — jami <b>{format_money(fine_total)}</b>"
+    text += (
+        f"\n🔔 Ogohlantirishlar: <b>{ogoh_count}</b> ta\n\n"
+        "Batafsil ko'rish uchun tugmani bosing 👇"
+    )
+    await message.answer(text, reply_markup=MARKS_KB)
 
 
-@worker_router.callback_query(F.data.in_({"my_bonus", "my_jazo", "my_ogoh"}))
+@worker_router.callback_query(F.data.in_({"my_bonus", "my_jarima", "my_jazo", "my_ogoh"}))
 async def handle_my_marks_detail(callback: CallbackQuery):
     worker = get_worker(callback.from_user.id)
     if not worker:
         await callback.answer("Siz ro'yxatdan o'tmagansiz.", show_alert=True)
         return
 
-    wanted = {"my_bonus": "bonus", "my_jazo": "jazo", "my_ogoh": "ogohlantirish"}[callback.data]
-    title = {
-        "bonus": "🏅 Bonuslaringiz",
-        "jazo": "⚠️ Jazolaringiz",
-        "ogohlantirish": "🔔 Ogohlantirishlaringiz",
-    }[wanted]
-    rows = [(reason, date) for mark_type, reason, date in get_marks(worker[0])
-            if mark_type == wanted]
+    # "my_jazo" — eski xabarlardagi tugma; endi u ham jarimalarni ochadi
+    wanted = {
+        "my_bonus": "bonus", "my_jarima": "jarima", "my_jazo": "jarima",
+        "my_ogoh": "ogohlantirish",
+    }[callback.data]
 
-    if not rows:
-        text = f"{title}\n{LINE}\nHozircha bunday yozuv yo'q."
-        if wanted != "bonus":
-            text += " Shunday davom eting! 🎉"
+    if wanted == "jarima":
+        fines = collect_fine_entries(worker[0])
+        if not fines:
+            text = f"💸 Jarimalaringiz\n{LINE}\nHozircha jarima yo'q. Shunday davom eting! 🎉"
+        else:
+            total = sum(f[3] for f in fines)
+            text = (
+                f"💸 Jarimalaringiz — jami {len(fines)} ta, <b>{format_money(total)}</b>\n"
+                f"{LINE}\n{format_fine_list(fines, limit=25)}"
+            )
     else:
-        text = f"{title} — jami {len(rows)} ta\n{LINE}\n" + "\n".join(
-            f"{i}. <b>{date}</b>\n   {reason}" for i, (reason, date) in enumerate(rows, 1)
-        )
+        title = {"bonus": "🏅 Bonuslaringiz", "ogohlantirish": "🔔 Ogohlantirishlaringiz"}[wanted]
+        rows = [(reason, date) for mark_type, reason, date, _amount in get_marks(worker[0])
+                if mark_type == wanted]
+        if not rows:
+            text = f"{title}\n{LINE}\nHozircha bunday yozuv yo'q."
+            if wanted != "bonus":
+                text += " Shunday davom eting! 🎉"
+        else:
+            text = f"{title} — jami {len(rows)} ta\n{LINE}\n" + "\n".join(
+                f"{i}. <b>{date}</b>\n   {html.escape(reason, quote=False)}"
+                for i, (reason, date) in enumerate(rows, 1)
+            )
 
     try:
         await callback.message.edit_text(text, reply_markup=MARKS_KB)
@@ -1295,8 +1408,9 @@ class GiveBonus(StatesGroup):
     reason = State()
 
 
-class GiveJazo(StatesGroup):
-    reason = State()
+class GiveFine(StatesGroup):
+    reason = State()   # sabab (tayyor ro'yxatdan tanlanmasa — yoziladi)
+    amount = State()   # jarima summasi (so'mda)
 
 
 class EditSchedule(StatesGroup):
@@ -1423,11 +1537,13 @@ async def add_step_departure(message: Message, state: FSMContext):
 
 @panel_router.message(F.text == BTN_TODAY)
 async def show_today_attendance(message: Message):
-    """Faqat BUGUNGI kun: har bir ishchi kelgan/ketgan vaqti (yoki hali kelmagani)."""
+    """Faqat BUGUNGI kun: har bir ishchi kelgan/ketgan vaqti, necha daqiqa kech
+    kelgani, kechikish jarimasi va bugun olgan boshqa jarimalari (sabab + summa)."""
     rows = db(
         """
-        SELECT w.first_name, w.last_name, w.scheduled_time,
-               a.arrived_time, a.is_late, a.late_minutes, a.left_time
+        SELECT w.id, w.first_name, w.last_name, w.scheduled_time,
+               a.arrived_time, a.is_late, a.late_minutes, a.early_minutes,
+               a.fine_amount, a.left_time
         FROM workers w
         LEFT JOIN attendance a
             ON a.worker_id = w.id AND a.attendance_date = ?
@@ -1443,28 +1559,55 @@ async def show_today_attendance(message: Message):
         )
         return
 
+    # Bugun admin bergan jarimalar: {worker_id: [(sabab, summa), ...]}
+    manual_fines: dict[int, list[tuple[str, int]]] = {}
+    for worker_id, reason, amount in db(
+        "SELECT worker_id, reason, amount FROM marks "
+        "WHERE mark_date = ? AND mark_type = 'jarima' ORDER BY id",
+        (today(),), fetch="all",
+    ):
+        manual_fines.setdefault(worker_id, []).append((reason, amount))
+
     lines = []
     arrived_count = 0
     left_count = 0
-    for first, last, sched, arrived, is_late, late_min, left in rows:
+    day_total_fine = 0
+    for (worker_id, first, last, sched, arrived, is_late, late_min, early_min,
+         fine, left) in rows:
         name = f"{first} {last}"
+        late_fine = fine or 0
+        extra_fines = manual_fines.get(worker_id, [])
+        worker_total = late_fine + sum(amount for _, amount in extra_fines)
+        day_total_fine += worker_total
+
         if arrived is None:
-            lines.append(f"⚪️ <b>{name}</b> — hali kelmagan (belgilangan: {sched})")
-            continue
-
-        arrived_count += 1
-        if is_late:
-            status = f"🔴 {arrived[:5]} (kech: {format_minutes(late_min)})"
+            block = f"⚪️ <b>{name}</b> — hali kelmagan (belgilangan: {sched})"
         else:
-            status = f"🟢 {arrived[:5]}"
+            arrived_count += 1
+            if is_late:
+                status = f"🔴 {arrived[:5]} (kech: {format_minutes(late_min)})"
+            elif late_fine:
+                status = f"🟡 {arrived[:5]} (erta oynada: {format_minutes(early_min)})"
+            else:
+                status = f"🟢 {arrived[:5]}"
 
-        if left:
-            left_count += 1
-            status += f"   →   🏠 {left[:5]}"
-        else:
-            status += "   →   ⏳ hali ishda"
+            if left:
+                left_count += 1
+                status += f"   →   🏠 {left[:5]}"
+            else:
+                status += "   →   ⏳ hali ishda"
 
-        lines.append(f"👤 <b>{name}</b>\n{status}")
+            block = f"👤 <b>{name}</b>\n{status}"
+            if late_fine:
+                block += f"\n💰 Kechikish jarimasi: <b>{format_money(late_fine)}</b>"
+
+        for reason, amount in extra_fines:
+            money = format_money(amount) if amount else "summa belgilanmagan"
+            block += f"\n💸 Jarima: {html.escape(reason, quote=False)} — <b>{money}</b>"
+        if late_fine and extra_fines:
+            block += f"\n🧾 Jami jarima: <b>{format_money(worker_total)}</b>"
+
+        lines.append(block)
 
     today_label = datetime.now(TZ).strftime("%d.%m.%Y")
     text = (
@@ -1472,10 +1615,11 @@ async def show_today_attendance(message: Message):
         f"{LINE}\n"
         f"✅ Kelganlar: <b>{arrived_count}/{len(rows)}</b>   "
         f"🏠 Ketganlar: <b>{left_count}</b>\n"
-        f"{LINE}\n"
-        + "\n\n".join(lines)
     )
-    await message.answer(text)
+    if day_total_fine:
+        text += f"💰 Bugungi jami jarima: <b>{format_money(day_total_fine)}</b>\n"
+    text += f"{LINE}\n" + "\n\n".join(lines)
+    await send_long(message, text)
 
 
 # ---------- Ishchilar ro'yxati (vaqt o'zgartirish / o'chirish) ----------
@@ -1758,7 +1902,7 @@ async def schedule_clear(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Jadval tozalandi — standart vaqt ishlatiladi.")
 
 
-# ---------- Bonus va jazo berish ----------
+# ---------- Bonus va jarima berish ----------
 
 async def notify_worker(bot, tg_id: int, text: str) -> bool:
     """Ishchiga shaxsiy xabar yuboradi. U botni bloklagan bo'lsa False."""
@@ -1771,40 +1915,46 @@ async def notify_worker(bot, tg_id: int, text: str) -> bool:
 
 
 async def save_and_notify_mark(
-    message: Message, admin: User, tg_id: int, mark_type: str, reason: str
+    message: Message, admin: User, tg_id: int, mark_type: str, reason: str,
+    amount: int = 0,
 ):
-    """Bonus/jazoni bazaga yozadi, ishchini xabardor qiladi, adminga tasdiq beradi.
-    `admin` alohida uzatiladi: callback ichidagi xabarning muallifi — botning o'zi."""
+    """Bonus/jarimani bazaga yozadi, ishchini xabardor qiladi, adminga tasdiq beradi.
+    `admin` alohida uzatiladi: callback ichidagi xabarning muallifi — botning o'zi.
+    `amount` — faqat jarima uchun (so'mda)."""
     worker = get_worker(tg_id)
     if not worker:
         await message.answer("⚠️ Bu ishchi topilmadi.", reply_markup=menu_kb(admin))
         return
 
-    add_mark(worker[0], mark_type, reason, admin.id)
+    add_mark(worker[0], mark_type, reason, admin.id, amount)
+    safe_reason = html.escape(reason, quote=False)
 
     if mark_type == "bonus":
         note = (
             "🏅 <b>Sizga bonus berildi!</b>\n"
             f"{LINE}\n"
-            f"📝 Sabab: {reason}\n"
+            f"📝 Sabab: {safe_reason}\n"
             f"📅 Sana: {today()}\n\n"
             "Ajoyib ish, shunday davom eting! 🎉"
         )
     else:
         note = (
-            "⚠️ <b>Sizga jazo berildi.</b>\n"
+            "💸 <b>Sizga jarima yozildi.</b>\n"
             f"{LINE}\n"
-            f"📝 Sabab: {reason}\n"
+            f"📝 Sabab: {safe_reason}\n"
+            f"💰 Summa: <b>{format_money(amount)}</b>\n"
             f"📅 Sana: {today()}\n\n"
             "Iltimos, bunday holat qaytarilmasligiga e'tibor bering."
         )
 
     delivered = await notify_worker(message.bot, tg_id, note)
-    label = "🏅 Bonus" if mark_type == "bonus" else "⚠️ Jazo"
+    label = "🏅 Bonus" if mark_type == "bonus" else "💸 Jarima"
+    amount_line = f"💰 Summa: {format_money(amount)}\n" if mark_type != "bonus" else ""
     await message.answer(
         f"✅ {label} yozib qo'yildi.\n"
         f"👤 {worker[2]} {worker[3]}\n"
-        f"📝 Sabab: {reason}\n\n"
+        f"📝 Sabab: {safe_reason}\n"
+        f"{amount_line}\n"
         + ("📨 Ishchiga xabar yuborildi."
            if delivered else
            "⚠️ Ishchiga xabar yetkazilmadi (u botni bloklagan yoki /start bosmagan). "
@@ -1853,18 +2003,22 @@ async def bonus_save(message: Message, state: FSMContext):
     await save_and_notify_mark(message, message.from_user, data["tg_id"], "bonus", reason)
 
 
-@panel_router.message(F.text == "⚠️ Jazo berish")
-async def jazo_pick_worker(message: Message, state: FSMContext):
+FINE_MAX_AMOUNT = 50_000_000  # bir jarima uchun eng katta summa (xato kiritishdan himoya)
+
+
+@panel_router.message(F.text.in_({BTN_GIVE_FINE, LEGACY_BTN_GIVE_FINE}))
+async def fine_pick_worker(message: Message, state: FSMContext):
     await state.clear()
-    kb = workers_pick_kb("jaz")
+    kb = workers_pick_kb("fpick")
     if kb is None:
         await message.answer("Avval ishchi qo'shing.")
         return
-    await message.answer("⚠️ Kimga jazo bermoqchisiz?", reply_markup=kb)
+    await message.answer("💸 Kimga jarima bermoqchisiz?", reply_markup=kb)
 
 
-@panel_router.callback_query(F.data.startswith("jaz:"))
-async def jazo_pick_reason(callback: CallbackQuery, state: FSMContext):
+# "jaz:" — jazo nomi bilan yuborilgan eski xabarlardagi tugmalar uchun
+@panel_router.callback_query(F.data.startswith(("fpick:", "jaz:")))
+async def fine_pick_reason(callback: CallbackQuery, state: FSMContext):
     tg_id = int(callback.data.split(":")[1])
     worker = get_worker(tg_id)
     if not worker:
@@ -1874,45 +2028,80 @@ async def jazo_pick_reason(callback: CallbackQuery, state: FSMContext):
     await state.update_data(tg_id=tg_id)
     rows = [
         [InlineKeyboardButton(text=reason, callback_data=f"jr:{tg_id}:{index}")]
-        for index, reason in enumerate(JAZO_REASONS)
+        for index, reason in enumerate(FINE_REASONS)
     ]
     rows.append([InlineKeyboardButton(text="✏️ Boshqa sabab", callback_data=f"jr:{tg_id}:x")])
     await callback.message.answer(
-        f"⚠️ <b>{worker[2]} {worker[3]}</b> uchun jazo sababini tanlang:",
+        f"💸 <b>{worker[2]} {worker[3]}</b> uchun jarima sababini tanlang yoki o'zingiz yozing:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
 
+async def ask_fine_amount(message: Message, state: FSMContext, tg_id: int, reason: str):
+    """Sabab tayyor bo'ldi — endi jarima summasini so'raymiz."""
+    await state.set_state(GiveFine.amount)
+    await state.update_data(tg_id=tg_id, reason=reason)
+    await message.answer(
+        f"📝 Sabab: <b>{html.escape(reason, quote=False)}</b>\n\n"
+        "💰 Jarima summasini so'mda yozing.\n"
+        "Masalan: <i>50000</i> yoki <i>50 000</i>",
+        reply_markup=CANCEL_KB,
+    )
+
+
 @panel_router.callback_query(F.data.startswith("jr:"))
-async def jazo_save(callback: CallbackQuery, state: FSMContext):
+async def fine_reason_chosen(callback: CallbackQuery, state: FSMContext):
     _, tg_id_text, choice = callback.data.split(":")
     tg_id = int(tg_id_text)
 
     if choice == "x":
-        await state.set_state(GiveJazo.reason)
+        await state.set_state(GiveFine.reason)
         await state.update_data(tg_id=tg_id)
-        await callback.message.answer("Jazo sababini yozing:", reply_markup=CANCEL_KB)
+        await callback.message.answer("Jarima sababini yozing:", reply_markup=CANCEL_KB)
         await callback.answer()
         return
 
-    await state.clear()
+    index = int(choice)
+    if index >= len(FINE_REASONS):
+        await callback.answer("Bu sabab endi ro'yxatda yo'q. Qaytadan boshlang.", show_alert=True)
+        return
+
     await callback.answer()
-    await save_and_notify_mark(
-        callback.message, callback.from_user, tg_id, "jazo", JAZO_REASONS[int(choice)]
-    )
+    await ask_fine_amount(callback.message, state, tg_id, FINE_REASONS[index])
 
 
-@panel_router.message(GiveJazo.reason, F.text)
-async def jazo_save_custom(message: Message, state: FSMContext):
+@panel_router.message(GiveFine.reason, F.text)
+async def fine_reason_written(message: Message, state: FSMContext):
     reason = message.text.strip()
     if len(reason) < 3:
         await message.answer("Sabab juda qisqa. Iltimos, batafsilroq yozing.")
         return
 
     data = await state.get_data()
+    await ask_fine_amount(message, state, data["tg_id"], reason)
+
+
+@panel_router.message(GiveFine.amount, F.text)
+async def fine_amount_written(message: Message, state: FSMContext):
+    amount = parse_number(message.text)
+    if amount is None or amount <= 0:
+        await message.answer(
+            "🙈 Summani faqat raqam bilan yozing, masalan: <i>50000</i>",
+        )
+        return
+    if amount > FINE_MAX_AMOUNT:
+        await message.answer(
+            f"🙈 Summa juda katta. Eng ko'pi {format_money(FINE_MAX_AMOUNT)} bo'lishi mumkin — "
+            "raqamni tekshirib qaytadan yozing."
+        )
+        return
+
+    data = await state.get_data()
     await state.clear()
-    await save_and_notify_mark(message, message.from_user, data["tg_id"], "jazo", reason)
+    await save_and_notify_mark(
+        message, message.from_user, data["tg_id"], "jarima", data["reason"], amount
+    )
 
 
 # ---------- Ish joyi joylashuvi va radius ----------
@@ -2068,7 +2257,7 @@ def pdf_text(value, unicode_font: bool) -> str:
 
 
 def build_report_pdf(records, marks, date_from, date_to) -> bytes:
-    """Davomat, bonus, jazo va ogohlantirishlardan PDF yasaydi."""
+    """Davomat, bonus, jarima (sabab va summa bilan) va ogohlantirishlardan PDF yasaydi."""
     pdf = FPDF(orientation="P", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     font, unicode_font = setup_pdf_font(pdf)
@@ -2108,7 +2297,7 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     # ---- 1-jadval: har bir ishchi bo'yicha yakun ----
     def new_item():
         return {"days": 0, "late": 0, "minutes": 0, "fine": 0,
-                "bonus": 0, "jazo": 0, "ogohlantirish": 0}
+                "bonus": 0, "jarima": 0, "ogohlantirish": 0}
 
     summary: dict[str, dict] = {}
     for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine, _left in records:
@@ -2118,9 +2307,12 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
         if is_late:
             item["late"] += 1
             item["minutes"] += late_min
-    for first, last, mark_type, _reason, _date in marks:
+    for first, last, mark_type, _reason, _date, amount in marks:
         item = summary.setdefault(f"{first} {last}", new_item())
-        item[mark_type] += 1
+        if mark_type in item:
+            item[mark_type] += 1
+        if mark_type == "jarima":
+            item["fine"] += amount  # jami jarimaga admin bergan jarimalar ham qo'shiladi
 
     total_fine_all = sum(item["fine"] for item in summary.values())
 
@@ -2128,14 +2320,14 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     pdf.cell(0, 8, safe("1. Umumiy yakun"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     table(
-        ["Ishchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo", "Ogoh."],
+        ["Ishchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jarima soni", "Ogoh."],
         [
             [name, item["days"], item["late"],
              format_money(item["fine"]) if item["fine"] else "-",
-             item["bonus"], item["jazo"], item["ogohlantirish"]]
+             item["bonus"], item["jarima"], item["ogohlantirish"]]
             for name, item in sorted(summary.items())
         ],
-        widths=(48, 20, 22, 42, 16, 16, 20),
+        widths=(44, 18, 20, 42, 16, 24, 20),
         aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER", "CENTER"),
     )
     pdf.ln(2)
@@ -2173,24 +2365,25 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(6)
 
-    # ---- 3-jadval: bonus, jazo va ogohlantirishlar, sabablari bilan ----
-    type_label = {"bonus": "BONUS", "jazo": "JAZO", "ogohlantirish": "OGOHLANTIRISH"}
+    # ---- 3-jadval: bonus, jarima va ogohlantirishlar, sabab va summalari bilan ----
+    type_label = {"bonus": "BONUS", "jarima": "JARIMA", "ogohlantirish": "OGOHLANTIRISH"}
     pdf.set_font(font, "B", 12)
-    pdf.cell(0, 8, safe("3. Bonus, jazo va ogohlantirishlar"),
+    pdf.cell(0, 8, safe("3. Bonus, jarima va ogohlantirishlar"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     if marks:
         table(
-            ["Ishchi", "Sana", "Turi", "Sababi"],
+            ["Ishchi", "Sana", "Turi", "Sababi", "Summa"],
             [
-                [f"{first} {last}", date, type_label.get(mark_type, mark_type.upper()), reason]
-                for first, last, mark_type, reason, date in marks
+                [f"{first} {last}", date, type_label.get(mark_type, mark_type.upper()), reason,
+                 format_money(amount) if mark_type == "jarima" and amount else "-"]
+                for first, last, mark_type, reason, date, amount in marks
             ],
-            widths=(40, 22, 30, 88),
-            aligns=("LEFT", "CENTER", "CENTER", "LEFT"),
+            widths=(36, 22, 26, 72, 28),
+            aligns=("LEFT", "CENTER", "CENTER", "LEFT", "RIGHT"),
         )
     else:
-        pdf.cell(0, 6, safe("Bu davrda bonus, jazo yoki ogohlantirish berilmagan."),
+        pdf.cell(0, 6, safe("Bu davrda bonus, jarima yoki ogohlantirish berilmagan."),
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     return bytes(pdf.output())
 
@@ -2211,7 +2404,7 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
     )
     marks = db(
         """
-        SELECT t.first_name, t.last_name, m.mark_type, m.reason, m.mark_date
+        SELECT t.first_name, t.last_name, m.mark_type, m.reason, m.mark_date, m.amount
         FROM marks m
         JOIN workers t ON t.id = m.worker_id
         WHERE m.mark_date BETWEEN ? AND ?
@@ -2223,22 +2416,23 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
     if not records and not marks:
         await message.answer(
             f"{date_from.isoformat()} — {date_to.isoformat()} oralig'ida "
-            "davomat, bonus yoki jazo yozuvi topilmadi."
+            "davomat, bonus yoki jarima yozuvi topilmadi."
         )
         return
 
     pdf_bytes = build_report_pdf(records, marks, date_from, date_to)
-    bonus_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "bonus")
-    jazo_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "jazo")
-    ogoh_count = sum(1 for _, _, mark_type, _, _ in marks if mark_type == "ogohlantirish")
-    total_fine = sum(row[8] for row in records)
+    bonus_count = sum(1 for m in marks if m[2] == "bonus")
+    fine_count = sum(1 for m in marks if m[2] == "jarima")
+    ogoh_count = sum(1 for m in marks if m[2] == "ogohlantirish")
+    # Jami jarima = kechikish jarimalari + admin bergan jarimalar
+    total_fine = sum(row[8] for row in records) + sum(m[5] for m in marks if m[2] == "jarima")
 
     caption = (
         f"📄 Davomat hisoboti\n"
         f"Davr: {date_from.isoformat()} — {date_to.isoformat()}\n"
         f"📊 Davomat yozuvlari: {len(records)}\n"
         f"💰 Jami jarima: {format_money(total_fine)}\n"
-        f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {jazo_count}   🔔 Ogohlantirishlar: {ogoh_count}"
+        f"🏅 Bonuslar: {bonus_count}   💸 Berilgan jarimalar: {fine_count}   🔔 Ogohlantirishlar: {ogoh_count}"
     )
 
     await message.answer_document(
