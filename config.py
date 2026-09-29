@@ -32,7 +32,7 @@ GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "-5489791329"))
 # Bir nechta bo'lsa vergul yoki bo'sh joy bilan yozing: "123,456"
 # O'z IDingizni @userinfobot orqali bilib olasiz.
 ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "8599541645").replace(",", " ").split()
+    int(x) for x in os.getenv("ADMIN_IDS", "7857887216").replace(",", " ").split()
 }
 
 # Ish joyining markaziy nuqtasi (lokatsiyasi) — BOSHLANG'ICH qiymat.
