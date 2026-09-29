@@ -212,6 +212,21 @@ def init_db():
             conn.commit()
 
 
+def log_db_diagnostics():
+    """VAQTINCHALIK DIAGNOSTIKA — ma'lumot yo'qolish sababini aniqlash uchun.
+    Muammo topilgach shu funksiyani va uning chaqiruvini o'chirib tashlash mumkin."""
+    try:
+        exists = os.path.exists(DB_PATH)
+        size = os.path.getsize(DB_PATH) if exists else 0
+        emp_count = db("SELECT COUNT(*) FROM employees", fetch="one")[0]
+        logger.warning(
+            "DIAGNOSTIKA: DB_PATH=%s | fayl mavjudmi=%s | hajmi=%s bayt | "
+            "ishchilar soni=%s", DB_PATH, exists, size, emp_count,
+        )
+    except Exception:
+        logger.exception("DIAGNOSTIKA: tekshirishda xatolik")
+
+
 def today() -> str:
     """Joriy sana — config'dagi vaqt zonasi bo'yicha (server UTC bo'lsa ham to'g'ri)."""
     return datetime.now(TZ).date().isoformat()
@@ -2599,6 +2614,7 @@ async def cmd_pdf_report(message: Message):
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
+    log_db_diagnostics()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
