@@ -6,14 +6,15 @@ Fayl tuzilishi (bo'limlar):
   2. YORDAMCHI FUNKSIYALAR — masofa, vaqt formati, admin tekshiruvi
   3. KLAVIATURALAR — tugmalar
   4. /START — hamma uchun kirish nuqtasi
-  5. ISHCHI QISMI — keldim va ketyapman (jonli joylashuv bilan), statistika, bonus/jazolarim
+  5. ISHCHI QISMI — keldim va ketyapman (jonli joylashuv bilan), statistika, bonus/jarimalarim
   6. ADMIN PANELI — tugmalar orqali boshqarish (qadam-baqadam)
-  7. PDF HISOBOT — davomat + bonus/jazo sabablari bilan
-  8. ADMIN BUYRUQLARI — matnli buyruqlar (ixtiyoriy)
+  7. PDF HISOBOT — davomat + bonus/jarima sabablari va summalari bilan
+  8. ADMIN BUYRUQLARI — eski matnli buyruqlar (ixtiyoriy)
   9. ISHGA TUSHIRISH
 """
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -45,7 +46,7 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
-from config import (
+from susambil.config import (
     ADMIN_IDS,
     BOT_TOKEN,
     CENTER_LATITUDE,
@@ -66,13 +67,6 @@ from config import (
 logger = logging.getLogger(__name__)
 TZ = ZoneInfo(TIMEZONE)
 
-# DB_PATH Railway Volume kabi alohida papkaga (masalan /data) ko'rsatilganda,
-# sqlite3.connect() o'zi papkani yaratib bermaydi — mavjud bo'lmasa "unable to
-# open database file" xatosini beradi. Shu sabab papkani oldindan yaratamiz.
-_db_dir = os.path.dirname(DB_PATH)
-if _db_dir:
-    os.makedirs(_db_dir, exist_ok=True)
-
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -81,8 +75,14 @@ BTN_ARRIVE = "✅ Keldim"
 BTN_LEAVE = "🏠 Ketyapman"
 BTN_BACK = "↩️ Orqaga"
 BTN_STATS = "📊 Statistikam"
-BTN_MARKS = "🏅 Bonus va jazolarim"
+BTN_MARKS = "🏅 Bonus va jarimalarim"
+BTN_GIVE_FINE = "💸 Jarima berish"
+# "Jazo" endi "jarima" deb nomlangan. Telefonlarda eski klaviatura qolib ketgan bo'lsa
+# ham tugmalar ishlashi uchun eski yozuvlarni ham qabul qilamiz.
+LEGACY_BTN_MARKS = "🏅 Bonus va jazolarim"
+LEGACY_BTN_GIVE_FINE = "⚠️ Jazo berish"
 BTN_FINES = "💰 Jarima sozlamalari"
+BTN_TODAY = "📅 Bugungi davomat"
 
 # Xabarlardagi chiroyli ajratuvchi chiziq
 LINE = "━━━━━━━━━━━━━━"
@@ -102,8 +102,8 @@ WEEKDAYS = [
 # Yangi ishchi qo'shilganda beriladigan standart ketish vaqti
 DEFAULT_DEPARTURE = "18:00"
 
-# Jazo uchun tayyor sabablar — admin ro'yxatdan tanlaydi
-JAZO_REASONS = [
+# Jarima uchun tayyor sabablar — admin ro'yxatdan tanlaydi (yoki o'zi yozadi)
+FINE_REASONS = [
     "Rangli ichimlik yoki xidli mahsulot iste'mol qilish",
     "Uniforma kiymaganligi",
     "Ish vaqtida mobil qurilmalardan foydalanish",
@@ -138,58 +138,58 @@ def init_db():
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.executescript(
             f"""
-            CREATE TABLE IF NOT EXISTS employees (
+            CREATE TABLE IF NOT EXISTS workers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE NOT NULL,
                 first_name TEXT NOT NULL,
                 last_name TEXT NOT NULL,
-                scheduled_time TEXT NOT NULL,  -- 'HH:MM' standart kelish vaqti
-                departure_time TEXT NOT NULL DEFAULT '{DEFAULT_DEPARTURE}'  -- 'HH:MM' standart ketish vaqti
+                scheduled_time TEXT NOT NULL,   -- standart kelish vaqti 'HH:MM'
+                departure_time TEXT NOT NULL DEFAULT '{DEFAULT_DEPARTURE}'  -- standart ketish vaqti
             );
             CREATE TABLE IF NOT EXISTS attendance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                employee_id INTEGER NOT NULL,
+                worker_id INTEGER NOT NULL,
                 attendance_date TEXT NOT NULL,
                 arrived_time TEXT NOT NULL,
                 is_late INTEGER NOT NULL,
-                late_minutes INTEGER NOT NULL,          -- belgilangan vaqtdan keyingi daqiqalar
+                late_minutes INTEGER NOT NULL,           -- belgilangan vaqtdan keyingi daqiqalar
                 early_minutes INTEGER NOT NULL DEFAULT 0,-- deadline bilan belgilangan vaqt orasidagi daqiqalar
                 fine_amount INTEGER NOT NULL DEFAULT 0,  -- jami jarima (so'mda)
                 scheduled_time TEXT,                     -- o'sha kunga amal qilgan belgilangan vaqt
                 left_time TEXT,                          -- ketgan vaqt 'HH:MM:SS' yoki NULL
                 left_lat REAL,                           -- ketayotganda yuborilgan joylashuv
                 left_lon REAL,
-                FOREIGN KEY (employee_id) REFERENCES employees (id)
+                FOREIGN KEY (worker_id) REFERENCES workers (id)
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_employee_date
-                ON attendance (employee_id, attendance_date);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_worker_date
+                ON attendance (worker_id, attendance_date);
 
             -- Haftalik jadval: har bir kun uchun alohida kelish/ketish vaqti.
-            -- Qator yo'q  -> o'sha kunga ishchining standart vaqti ishlatiladi.
-            -- arrive_time NULL -> o'sha kun dam olish kuni deb belgilangan.
+            -- Qator yo'q  -> o'sha kunga standart vaqt ishlatiladi.
+            -- arrive_time NULL -> o'sha kun dam olish kuni.
             CREATE TABLE IF NOT EXISTS schedules (
-                employee_id INTEGER NOT NULL,
+                worker_id INTEGER NOT NULL,
                 weekday INTEGER NOT NULL,     -- 0 = dushanba ... 6 = yakshanba
                 arrive_time TEXT,             -- 'HH:MM' yoki NULL (dam olish kuni)
                 leave_time TEXT,              -- 'HH:MM' yoki NULL
-                PRIMARY KEY (employee_id, weekday),
-                FOREIGN KEY (employee_id) REFERENCES employees (id)
+                PRIMARY KEY (worker_id, weekday),
+                FOREIGN KEY (worker_id) REFERENCES workers (id)
             );
 
-            -- Bonus va jazolar
+            -- Bonus, jarima va ogohlantirishlar
             CREATE TABLE IF NOT EXISTS marks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                employee_id INTEGER NOT NULL,
-                mark_type TEXT NOT NULL,      -- 'bonus', 'jazo' yoki 'ogohlantirish'
+                worker_id INTEGER NOT NULL,
+                mark_type TEXT NOT NULL,      -- 'bonus', 'jarima' yoki 'ogohlantirish'
                 reason TEXT NOT NULL,
-                amount INTEGER NOT NULL DEFAULT 0,  -- bonus/jazo summasi (so'mda), bo'lmasa 0
                 mark_date TEXT NOT NULL,      -- 'YYYY-MM-DD'
                 created_at TEXT NOT NULL,     -- 'HH:MM:SS'
                 admin_id INTEGER NOT NULL,
-                FOREIGN KEY (employee_id) REFERENCES employees (id)
+                amount INTEGER NOT NULL DEFAULT 0,  -- jarima yoki bonus summasi (so'mda)
+                FOREIGN KEY (worker_id) REFERENCES workers (id)
             );
-            CREATE INDEX IF NOT EXISTS idx_marks_employee_date
-                ON marks (employee_id, mark_date);
+            CREATE INDEX IF NOT EXISTS idx_marks_worker_date
+                ON marks (worker_id, mark_date);
 
             -- Botdan turib o'zgartiriladigan sozlamalar (ish joyi koordinatasi, radius, jarimalar).
             -- Qator bo'lmasa — config.py dagi qiymat ishlatiladi.
@@ -199,32 +199,14 @@ def init_db():
             );
             """
         )
-        conn.commit()
-
-        # Migratsiya: "marks" jadvali eski (Volume'da saqlangan) bazada
-        # "amount" ustunisiz yaratilgan bo'lishi mumkin — CREATE TABLE IF NOT
-        # EXISTS mavjud jadvalga yangi ustun qo'shmaydi, shuning uchun bu yerda
-        # alohida tekshirib, kerak bo'lsa qo'shamiz. Mavjud yozuvlar va
-        # ma'lumotlar yo'qolmaydi.
-        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(marks)")}
-        if "amount" not in existing_columns:
+        # Eski bazalar uchun: marks jadvaliga jarima summasi ustunini qo'shamiz
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(marks)")}
+        if "amount" not in columns:
             conn.execute("ALTER TABLE marks ADD COLUMN amount INTEGER NOT NULL DEFAULT 0")
-            conn.commit()
-
-
-def log_db_diagnostics():
-    """VAQTINCHALIK DIAGNOSTIKA — ma'lumot yo'qolish sababini aniqlash uchun.
-    Muammo topilgach shu funksiyani va uning chaqiruvini o'chirib tashlash mumkin."""
-    try:
-        exists = os.path.exists(DB_PATH)
-        size = os.path.getsize(DB_PATH) if exists else 0
-        emp_count = db("SELECT COUNT(*) FROM employees", fetch="one")[0]
-        logger.warning(
-            "DIAGNOSTIKA: DB_PATH=%s | fayl mavjudmi=%s | hajmi=%s bayt | "
-            "ishchilar soni=%s", DB_PATH, exists, size, emp_count,
-        )
-    except Exception:
-        logger.exception("DIAGNOSTIKA: tekshirishda xatolik")
+        # "Jazo" va "jarima" endi bitta tushuncha: eski jazo yozuvlari jarima bo'ldi
+        # (ularning summasi o'sha paytda kiritilmagan, shuning uchun 0 bo'lib qoladi)
+        conn.execute("UPDATE marks SET mark_type = 'jarima' WHERE mark_type = 'jazo'")
+        conn.commit()
 
 
 def today() -> str:
@@ -329,22 +311,22 @@ def get_fine_rates() -> dict[str, int]:
     return rates
 
 
-def get_employee(telegram_id: int):
+def get_worker(telegram_id: int):
     """(id, telegram_id, ism, familiya, kelish_vaqti, ketish_vaqti) yoki None."""
     return db(
         "SELECT id, telegram_id, first_name, last_name, scheduled_time, departure_time "
-        "FROM employees WHERE telegram_id = ?",
+        "FROM workers WHERE telegram_id = ?",
         (telegram_id,), fetch="one",
     )
 
 
-def add_employee(
+def add_worker(
     telegram_id: int, first_name: str, last_name: str,
     sched_time: str, departure: str = DEFAULT_DEPARTURE,
 ) -> bool:
     try:
         db(
-            "INSERT INTO employees "
+            "INSERT INTO workers "
             "(telegram_id, first_name, last_name, scheduled_time, departure_time) "
             "VALUES (?, ?, ?, ?, ?)",
             (telegram_id, first_name, last_name, sched_time, departure),
@@ -356,118 +338,192 @@ def add_employee(
 
 # ---------- Haftalik jadval ----------
 
-def get_day_schedule(employee_id: int, weekday: int):
+def get_day_schedule(worker_id: int, weekday: int):
     """Shu hafta kuni uchun (kelish, ketish) juftligi.
     None — bu kunga alohida jadval yo'q (standart vaqt ishlatiladi).
     Kelish None bo'lsa — kun dam olish kuni deb belgilangan."""
     return db(
-        "SELECT arrive_time, leave_time FROM schedules WHERE employee_id = ? AND weekday = ?",
-        (employee_id, weekday), fetch="one",
+        "SELECT arrive_time, leave_time FROM schedules WHERE worker_id = ? AND weekday = ?",
+        (worker_id, weekday), fetch="one",
     )
 
 
-def get_week_schedule(employee_id: int) -> dict[int, tuple]:
+def get_week_schedule(worker_id: int) -> dict[int, tuple]:
     """{hafta_kuni: (kelish, ketish)} — faqat belgilangan kunlar."""
     rows = db(
-        "SELECT weekday, arrive_time, leave_time FROM schedules WHERE employee_id = ?",
-        (employee_id,), fetch="all",
+        "SELECT weekday, arrive_time, leave_time FROM schedules WHERE worker_id = ?",
+        (worker_id,), fetch="all",
     )
     return {weekday: (arrive, leave) for weekday, arrive, leave in rows}
 
 
-def set_day_schedule(employee_id: int, weekday: int, arrive: str | None, leave: str | None):
+def set_day_schedule(worker_id: int, weekday: int, arrive: str | None, leave: str | None):
     db(
-        "INSERT INTO schedules (employee_id, weekday, arrive_time, leave_time) "
+        "INSERT INTO schedules (worker_id, weekday, arrive_time, leave_time) "
         "VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(employee_id, weekday) DO UPDATE SET arrive_time = ?, leave_time = ?",
-        (employee_id, weekday, arrive, leave, arrive, leave),
+        "ON CONFLICT(worker_id, weekday) DO UPDATE SET arrive_time = ?, leave_time = ?",
+        (worker_id, weekday, arrive, leave, arrive, leave),
     )
 
 
-def clear_week_schedule(employee_id: int) -> int:
-    return db("DELETE FROM schedules WHERE employee_id = ?", (employee_id,))
+def clear_week_schedule(worker_id: int) -> int:
+    return db("DELETE FROM schedules WHERE worker_id = ?", (worker_id,))
 
 
-def times_for_day(employee, when: datetime) -> tuple[str | None, str | None]:
+def times_for_day(worker, when: datetime) -> tuple[str | None, str | None]:
     """O'sha kunga amal qiladigan (kelish, ketish) vaqtlari.
     Haftalik jadvalda qator bo'lsa — o'sha, aks holda standart vaqtlar."""
-    day = get_day_schedule(employee[0], when.weekday())
+    day = get_day_schedule(worker[0], when.weekday())
     if day is not None:
         return day[0], day[1]
-    return employee[4], employee[5]
+    return worker[4], worker[5]
 
 
-# ---------- Bonus va jazolar ----------
+# ---------- Bonus va jarimalar ----------
 
-def add_mark(employee_id: int, mark_type: str, reason: str, admin_id: int, amount: int = 0):
+def add_mark(
+    worker_id: int, mark_type: str, reason: str, admin_id: int, amount: int = 0,
+):
     now = datetime.now(TZ)
     db(
-        "INSERT INTO marks (employee_id, mark_type, reason, amount, mark_date, created_at, admin_id) "
+        "INSERT INTO marks "
+        "(worker_id, mark_type, reason, mark_date, created_at, admin_id, amount) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (employee_id, mark_type, reason, amount, now.date().isoformat(),
-         now.strftime("%H:%M:%S"), admin_id),
+        (worker_id, mark_type, reason, now.date().isoformat(),
+         now.strftime("%H:%M:%S"), admin_id, amount),
     )
 
 
-def count_marks(employee_id: int, mark_type: str) -> int:
-    """Ishchining shu turdagi (bonus/jazo/ogohlantirish) yozuvlari soni."""
+def count_marks(worker_id: int, mark_type: str) -> int:
+    """Ishchining shu turdagi (bonus/jarima/ogohlantirish) yozuvlari soni."""
     return db(
-        "SELECT COUNT(*) FROM marks WHERE employee_id = ? AND mark_type = ?",
-        (employee_id, mark_type), fetch="one",
+        "SELECT COUNT(*) FROM marks WHERE worker_id = ? AND mark_type = ?",
+        (worker_id, mark_type), fetch="one",
     )[0]
 
 
-def get_marks(employee_id: int, date_from=None, date_to=None):
-    """(turi, sabab, summa, sana) ro'yxati — eng yangisi birinchi."""
-    query = "SELECT mark_type, reason, amount, mark_date FROM marks WHERE employee_id = ?"
-    params: list = [employee_id]
+def get_marks(worker_id: int, date_from=None, date_to=None):
+    """(turi, sabab, sana, summa) ro'yxati — eng yangisi birinchi."""
+    query = "SELECT mark_type, reason, mark_date, amount FROM marks WHERE worker_id = ?"
+    params: list = [worker_id]
     if date_from and date_to:
         query += " AND mark_date BETWEEN ? AND ?"
         params += [date_from.isoformat(), date_to.isoformat()]
     return db(query + " ORDER BY mark_date DESC, id DESC", tuple(params), fetch="all")
 
 
+def late_fine_reason(
+    scheduled: str | None, arrived: str, early_min: int, late_min: int,
+) -> str:
+    """Kechikish jarimasining sababi (ishchiga ko'rsatiladigan matn)."""
+    base = f"Kechikish: belgilangan {scheduled or '—'}, keldi {arrived[:5]}"
+    if late_min:
+        return f"{base} ({format_minutes(late_min)} kech)"
+    return f"{base} (erta kelish oynasida {format_minutes(early_min)})"
+
+
+def collect_fine_entries(worker_id: int, date_from=None, date_to=None) -> list[tuple]:
+    """Ishchining BARCHA jarimalari bitta ro'yxatda: kechikish jarimalari (davomatdan)
+    va admin qo'lda bergan jarimalar. date_from/date_to — date obyektlari (ixtiyoriy).
+
+    Qaytaradi: [(sana, vaqt, sabab, summa, tur)] — eng yangisi birinchi;
+    tur: 'late' (kechikish) yoki 'manual' (admin bergan)."""
+    params: list = [worker_id]
+    date_filter = ""
+    if date_from and date_to:
+        date_filter = " AND {col} BETWEEN ? AND ?"
+        params += [date_from.isoformat(), date_to.isoformat()]
+
+    entries: list[tuple] = []
+    for date, arrived, sched, early_min, late_min, fine in db(
+        "SELECT attendance_date, arrived_time, scheduled_time, early_minutes, "
+        "late_minutes, fine_amount FROM attendance "
+        "WHERE worker_id = ? AND fine_amount > 0" + date_filter.format(col="attendance_date"),
+        tuple(params), fetch="all",
+    ):
+        entries.append((
+            date, arrived, late_fine_reason(sched, arrived, early_min, late_min),
+            fine, "late",
+        ))
+    for date, created, reason, amount in db(
+        "SELECT mark_date, created_at, reason, amount FROM marks "
+        "WHERE worker_id = ? AND mark_type = 'jarima'" + date_filter.format(col="mark_date"),
+        tuple(params), fetch="all",
+    ):
+        entries.append((date, created, reason, amount, "manual"))
+
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return entries
+
+
+def collect_bonus_entries(worker_id: int, date_from=None, date_to=None) -> list[tuple]:
+    """Ishchining bonuslari: [(sana, vaqt, sabab, summa, 'bonus')] — eng yangisi birinchi."""
+    query = (
+        "SELECT mark_date, created_at, reason, amount FROM marks "
+        "WHERE worker_id = ? AND mark_type = 'bonus'"
+    )
+    params: list = [worker_id]
+    if date_from and date_to:
+        query += " AND mark_date BETWEEN ? AND ?"
+        params += [date_from.isoformat(), date_to.isoformat()]
+    rows = db(query, tuple(params), fetch="all")
+    entries = [(date, created, reason, amount, "bonus") for date, created, reason, amount in rows]
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return entries
+
+
+def format_mark_list(entries: list[tuple], limit: int = 20) -> str:
+    """Jarima yoki bonuslar ro'yxatini sabab va summa bilan matnga aylantiradi."""
+    lines = []
+    for number, (date, _time, reason, amount, _kind) in enumerate(entries[:limit], 1):
+        money = format_money(amount) if amount else "summa belgilanmagan"
+        lines.append(f"{number}. <b>{date}</b> — {html.escape(reason, quote=False)}\n   💰 {money}")
+    if len(entries) > limit:
+        lines.append(f"… va yana {len(entries) - limit} ta (eskiroqlari)")
+    return "\n".join(lines)
+
+
 def record_attendance(
-    employee_id: int, arrived: str, is_late: bool, late_min: int,
+    worker_id: int, arrived: str, is_late: bool, late_min: int,
     early_min: int, fine_amount: int, scheduled: str | None,
 ) -> bool:
     """Davomatni yozadi; bugun allaqachon yozuv bo'lsa False qaytaradi."""
     return db(
         "INSERT OR IGNORE INTO attendance "
-        "(employee_id, attendance_date, arrived_time, is_late, late_minutes, "
+        "(worker_id, attendance_date, arrived_time, is_late, late_minutes, "
         "early_minutes, fine_amount, scheduled_time) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (employee_id, today(), arrived, int(is_late), late_min,
+        (worker_id, today(), arrived, int(is_late), late_min,
          early_min, fine_amount, scheduled),
     ) > 0
 
 
-def has_checked_in_today(employee_id: int) -> bool:
+def has_checked_in_today(worker_id: int) -> bool:
     return db(
-        "SELECT 1 FROM attendance WHERE employee_id = ? AND attendance_date = ?",
-        (employee_id, today()), fetch="one",
+        "SELECT 1 FROM attendance WHERE worker_id = ? AND attendance_date = ?",
+        (worker_id, today()), fetch="one",
     ) is not None
 
 
-def has_checked_out_today(employee_id: int) -> bool:
+def has_checked_out_today(worker_id: int) -> bool:
     """Bugun ish tugatilgani (ketgan vaqt yozilgani) belgilanganmi."""
     row = db(
-        "SELECT left_time FROM attendance WHERE employee_id = ? AND attendance_date = ?",
-        (employee_id, today()), fetch="one",
+        "SELECT left_time FROM attendance WHERE worker_id = ? AND attendance_date = ?",
+        (worker_id, today()), fetch="one",
     )
     return row is not None and row[0] is not None
 
 
 def record_checkout(
-    employee_id: int, left_time: str,
+    worker_id: int, left_time: str,
     lat: float | None = None, lon: float | None = None,
 ) -> bool:
     """Bugungi davomat yozuviga ketish vaqti va (bo'lsa) joylashuvini yozadi.
     Yozuv topilmasa yoki allaqachon ketgan bo'lsa False qaytaradi."""
     return db(
         "UPDATE attendance SET left_time = ?, left_lat = ?, left_lon = ? "
-        "WHERE employee_id = ? AND attendance_date = ? AND left_time IS NULL",
-        (left_time, lat, lon, employee_id, today()),
+        "WHERE worker_id = ? AND attendance_date = ? AND left_time IS NULL",
+        (left_time, lat, lon, worker_id, today()),
     ) > 0
 
 
@@ -492,7 +548,7 @@ def location_check(location) -> tuple[float, float, float]:
     Nega yon berish kerak: bino ichida telefon sun'iy yo'ldoshni ko'rmaydi va
     joylashuvni Wi-Fi/uyali tarmoq bo'yicha taxminlaydi. Telegram bunday
     joylashuv bilan birga "horizontal_accuracy" (xatolik radiusi) ni yuboradi —
-    u 100-500 metr bo'lishi mumkin. Shu xatolikni hisobga olmasak, ish joyida
+    u 100-500 metr bo'lishi mumkin. Shu xatolikni hisobga olmasak, markazda
     o'tirgan ishchi ham "uzoqdasiz" degan javob oladi.
     """
     center_lat, center_lon = get_center()
@@ -550,17 +606,42 @@ def compute_fine(
     return early_min, late_min, total, excessive
 
 
+async def send_long(message: Message, text: str, limit: int = 4000) -> None:
+    """Telegram xabari 4096 belgidan oshmasligi kerak — uzun matnni bloklar
+    (bo'sh qator) bo'yicha bir nechta xabarga bo'lib yuboradi."""
+    chunk = ""
+    for block in text.split("\n\n"):
+        candidate = f"{chunk}\n\n{block}" if chunk else block
+        if chunk and len(candidate) > limit:
+            await message.answer(chunk)
+            chunk = block
+        else:
+            chunk = candidate
+    if chunk:
+        await message.answer(chunk)
+
+
+async def notify_group(bot, text: str) -> None:
+    """Guruhga xabar yuboradi. GROUP_CHAT_ID belgilanmagan (0) bo'lsa — jim o'tkazib yuboradi."""
+    if not GROUP_CHAT_ID:
+        return
+    try:
+        await bot.send_message(GROUP_CHAT_ID, text)
+    except TelegramAPIError:
+        logger.exception("Guruhga (%s) xabar yuborib bo'lmadi", GROUP_CHAT_ID)
+
+
 def is_admin(user: User | None) -> bool:
     return user is not None and user.id in ADMIN_IDS
 
 
-def format_week_schedule(employee) -> str:
+def format_week_schedule(worker) -> str:
     """Ishchining haftalik jadvalini o'qiladigan matnga aylantiradi."""
-    week = get_week_schedule(employee[0])
+    week = get_week_schedule(worker[0])
     if not week:
         return (
             f"Haftalik jadval belgilanmagan — har kuni standart vaqt:\n"
-            f"🕘 Kelish: {employee[4]}   🕕 Ketish: {employee[5]}"
+            f"🕘 Kelish: {worker[4]}   🕕 Ketish: {worker[5]}"
         )
 
     lines = []
@@ -572,7 +653,7 @@ def format_week_schedule(employee) -> str:
             else:
                 lines.append(f"• {name}: 🕘 {arrive} — 🕕 {leave or '—'}")
         else:
-            lines.append(f"• {name}: {employee[4]} — {employee[5]} (standart)")
+            lines.append(f"• {name}: {worker[4]} — {worker[5]} (standart)")
     return "\n".join(lines)
 
 
@@ -594,8 +675,8 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
     """Foydalanuvchi kimligiga qarab asosiy menyu tugmalari:
     ishchiga — Keldim/Statistika, adminga — boshqaruv tugmalari."""
     rows = []
-    employee = get_employee(user.id)
-    if employee:
+    worker = get_worker(user.id)
+    if worker:
         rows.append([
             KeyboardButton(text=BTN_ARRIVE),
             KeyboardButton(text=BTN_LEAVE),
@@ -611,27 +692,30 @@ def menu_kb(user: User) -> ReplyKeyboardMarkup | None:
         ])
         rows.append([
             KeyboardButton(text="🏅 Bonus berish"),
-            KeyboardButton(text="⚠️ Jazo berish"),
+            KeyboardButton(text=BTN_GIVE_FINE),
         ])
         rows.append([
             KeyboardButton(text="📄 PDF hisobot"),
-            KeyboardButton(text="📍 Ish joyi lokatsiyasi"),
+            KeyboardButton(text=BTN_TODAY),
         ])
-        rows.append([KeyboardButton(text=BTN_FINES)])
+        rows.append([
+            KeyboardButton(text="📍 Ish joyi joylashuvi"),
+            KeyboardButton(text=BTN_FINES),
+        ])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True) if rows else None
 
 
-def employees_pick_kb(prefix: str) -> InlineKeyboardMarkup | None:
+def workers_pick_kb(prefix: str) -> InlineKeyboardMarkup | None:
     """Barcha ishchilar ro'yxatidan bittasini tanlash uchun tugmalar."""
-    employees = db(
-        "SELECT first_name, last_name, telegram_id FROM employees ORDER BY first_name, last_name",
+    workers = db(
+        "SELECT first_name, last_name, telegram_id FROM workers ORDER BY first_name, last_name",
         fetch="all",
     )
-    if not employees:
+    if not workers:
         return None
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{first} {last}", callback_data=f"{prefix}:{tg_id}")]
-        for first, last, tg_id in employees
+        for first, last, tg_id in workers
     ])
 
 
@@ -667,7 +751,7 @@ REPORT_KB = InlineKeyboardMarkup(
 MARKS_KB = InlineKeyboardMarkup(
     inline_keyboard=[[
         InlineKeyboardButton(text="🏅 Bonuslar", callback_data="my_bonus"),
-        InlineKeyboardButton(text="⚠️ Jazolar", callback_data="my_jazo"),
+        InlineKeyboardButton(text="💸 Jarimalar", callback_data="my_jarima"),
         InlineKeyboardButton(text="🔔 Ogohlantirishlar", callback_data="my_ogoh"),
     ]]
 )
@@ -697,9 +781,9 @@ panel_router = Router()
 panel_router.message.filter(F.chat.type == "private", F.from_user.id.in_(ADMIN_IDS))
 panel_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 
-employee_router = Router()
+worker_router = Router()
 # Guruhdagi "Keldim" yoki lokatsiya xabarlariga javob bermasligi uchun faqat shaxsiy chat
-employee_router.message.filter(F.chat.type == "private")
+worker_router.message.filter(F.chat.type == "private")
 
 
 # ==================== 4. /START ====================
@@ -727,11 +811,11 @@ class LeaveFlow(StatesGroup):
     location = State()  # "Ketyapman" bosildi — jonli joylashuv kutilmoqda
 
 
-@employee_router.message(CommandStart())
+@worker_router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()  # /start har doim jarayonni boshidan boshlaydi
     user = message.from_user
-    employee = get_employee(user.id)
+    worker = get_worker(user.id)
     kb = menu_kb(user)
 
     if is_admin(user):
@@ -741,13 +825,14 @@ async def cmd_start(message: Message, state: FSMContext):
             "Hamma narsa pastdagi tugmalar orqali — hech narsani yodlash shart emas 😊\n\n"
             "➕ <b>Ishchi qo'shish</b> — bot hammasini qadam-baqadam so'raydi\n"
             "📋 <b>Ishchilar ro'yxati</b> — vaqt, jadval, o'chirish\n"
-            "🏅 <b>Bonus berish</b> — yaxshi ish uchun rahmat\n"
-            "⚠️ <b>Jazo berish</b> — sababni ro'yxatdan tanlaysiz\n"
-            "📄 <b>PDF hisobot</b> — davomat, bonus va jazolar\n"
-            "📍 <b>Ish joyi lokatsiyasi</b> — ish joyi nuqtasi va radius\n"
+            "🏅 <b>Bonus berish</b> — sabab yoziladi, keyin summa kiritasiz\n"
+            "💸 <b>Jarima berish</b> — sabab tanlanadi yoki yoziladi, keyin summa kiritasiz\n"
+            "📄 <b>PDF hisobot</b> — davomat, bonus va jarimalar\n"
+            "📅 <b>Bugungi davomat</b> — kim keldi, kim ketdi, kim hali kelmagan\n"
+            "📍 <b>Ish joyi joylashuvi</b> — ish joyi nuqtasi va radius\n"
             f"{BTN_FINES} — kechikish jarimasi summalarini o'zgartirish"
         )
-        if employee:
+        if worker:
             text += (
                 f"\n\nSiz ishchi sifatida ham ro'yxatdasiz — "
                 f"<b>{BTN_ARRIVE}</b> va <b>{BTN_LEAVE}</b> tugmalari ishlaydi."
@@ -755,11 +840,11 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(text, reply_markup=kb)
         return
 
-    if not employee:
+    if not worker:
         await message.answer(not_registered_text(user.id))
         return
 
-    first_name = employee[2]
+    first_name = worker[2]
     text = (
         f"{greeting()}, <b>{first_name}</b>! 👋\n"
         f"{LINE}\n"
@@ -767,20 +852,20 @@ async def cmd_start(message: Message, state: FSMContext):
         f"🏠 Ketayotganda — <b>{BTN_LEAVE}</b>\n"
         "📍 Ikkalasida ham <b>jonli joylashuv</b> yuborasiz.\n"
     )
-    text += f"\n🗓 <b>Ish jadvalingiz</b>\n{format_week_schedule(employee)}"
+    text += f"\n🗓 <b>Ish jadvalingiz</b>\n{format_week_schedule(worker)}"
     await message.answer(text, reply_markup=kb)
 
 
 # ==================== 5. ISHCHI QISMI ====================
 
-@employee_router.message(F.text == BTN_ARRIVE)
+@worker_router.message(F.text == BTN_ARRIVE)
 async def handle_keldim(message: Message):
-    employee = get_employee(message.from_user.id)
-    if not employee:
+    worker = get_worker(message.from_user.id)
+    if not worker:
         await message.answer(not_registered_text(message.from_user.id))
         return
 
-    if has_checked_in_today(employee[0]):
+    if has_checked_in_today(worker[0]):
         await message.answer(ALREADY_CHECKED)
         return
 
@@ -835,35 +920,31 @@ def too_far_text(head: str, real_dist: float, tolerance: float, radius: int) -> 
     return text
 
 
-@employee_router.message(StateFilter(LeaveFlow.location), F.text == BTN_BACK)
+@worker_router.message(StateFilter(LeaveFlow.location), F.text == BTN_BACK)
 async def leave_back(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("👌 Yaxshi, bekor qilindi.", reply_markup=menu_kb(message.from_user))
 
 
-@employee_router.message(F.text == BTN_LEAVE)
+@worker_router.message(F.text == BTN_LEAVE)
 async def leave_start(message: Message, state: FSMContext):
     """\"Ketyapman\" bosildi — endi kelishdagi kabi JONLI joylashuv so'raladi.
     Ketish vaqti shu joylashuv kelgan paytda yoziladi."""
-    employee = get_employee(message.from_user.id)
-    if not employee:
+    worker = get_worker(message.from_user.id)
+    if not worker:
         await message.answer(not_registered_text(message.from_user.id))
         return
 
     # Avval kelgan bo'lishi kerak — aks holda yangilanadigan yozuv yo'q
-    if not has_checked_in_today(employee[0]):
+    if not has_checked_in_today(worker[0]):
         await message.answer(NOT_CHECKED_IN)
         return
 
-    if has_checked_out_today(employee[0]):
+    if has_checked_out_today(worker[0]):
         await message.answer(ALREADY_LEFT)
         return
 
     await state.set_state(LeaveFlow.location)
-    # Eski (masalan, "Keldim" paytida boshlangan va hali tugamagan) jonli
-    # joylashuvning navbatdagi yangilanishi "Ketyapman" uchun ham hisoblanib
-    # ketmasligi uchun — qaysi xabar ketish uchun kutilayotganini tozalaymiz.
-    await state.update_data(leave_msg_id=None)
     await message.answer(
         "🏠 <b>Ketyapman — joylashuvni yuboring</b>\n"
         f"{LINE}\n"
@@ -874,61 +955,37 @@ async def leave_start(message: Message, state: FSMContext):
     )
 
 
-@employee_router.message(StateFilter(LeaveFlow.location), F.location)
-async def handle_leave_location(message: Message, state: FSMContext, is_update: bool = False):
-    """is_update haqida — handle_location'dagi izohga qarang: bu ham jonli
-    joylashuvning keyingi yangilanishi bo'lishi mumkin, shunda jim tekshiramiz."""
-    employee = get_employee(message.from_user.id)
-    if not employee:
-        if is_update:
-            return
+@worker_router.message(StateFilter(LeaveFlow.location), F.location)
+async def handle_leave_location(message: Message, state: FSMContext):
+    worker = get_worker(message.from_user.id)
+    if not worker:
         await state.clear()
         await message.answer(not_registered_text(message.from_user.id))
         return
 
-    employee_id, first_name, last_name = employee[0], employee[2], employee[3]
+    worker_id, first_name, last_name = worker[0], worker[2], worker[3]
     menu = menu_kb(message.from_user)
 
-    if not has_checked_in_today(employee_id):
-        if is_update:
-            return
+    if not has_checked_in_today(worker_id):
         # "Ketyapman" faqat kelgan ishchiga ochiladi, demak bu — kechadan qolib
         # ketgan eski holat. Hozirgi lokatsiya esa aslida bugungi KELISH lokatsiyasi.
         await state.clear()
         await handle_location(message)
         return
-    if has_checked_out_today(employee_id):
-        if is_update:
-            return
+    if has_checked_out_today(worker_id):
         await state.clear()
         await message.answer(ALREADY_LEFT, reply_markup=menu)
         return
 
-    # Forward yoki oddiy nuqta bo'lsa — holat saqlanadi, employee qayta yuboradi
+    # Forward yoki oddiy nuqta bo'lsa — holat saqlanadi, worker qayta yuboradi
     problem = location_problem(message)
     if problem:
-        if is_update:
-            return
         await message.answer(problem, reply_markup=LEAVE_KB)
         return
-
-    if not is_update:
-        # Shu (yangi boshlangan) jonli joylashuv xabarining ID'sini eslab
-        # qolamiz — pastdagi edited_message handler faqat shu ID'ga tegishli
-        # yangilanishlarni qabul qiladi, boshqa (masalan, eski "Keldim"
-        # jonli joylashuvidan qolgan) yangilanishlarni emas.
-        await state.update_data(leave_msg_id=message.message_id)
 
     real_dist, tolerance, dist = location_check(message.location)
     radius = get_radius()
     if CHECKOUT_REQUIRES_CENTER and dist > radius:
-        logger.info(
-            "Ketish lokatsiyasi rad etildi (%s): employee_id=%s, masofa=%.0fm, xatolik=%.0fm",
-            "yangilanish" if is_update else "birinchi", employee_id, real_dist,
-            message.location.horizontal_accuracy or 0,
-        )
-        if is_update:
-            return
         await message.answer(
             too_far_text(
                 "🙈 <b>Siz ish joyidan uzoqdasiz.</b>\nKetayotganda ish joyida turib yuboring.",
@@ -936,13 +993,17 @@ async def handle_leave_location(message: Message, state: FSMContext, is_update: 
             ),
             reply_markup=LEAVE_KB,
         )
+        logger.info(
+            "Ketish lokatsiyasi rad etildi: worker_id=%s, masofa=%.0fm, xatolik=%.0fm",
+            worker_id, real_dist, message.location.horizontal_accuracy or 0,
+        )
         return
 
     now = datetime.now(TZ)
     left = now.strftime("%H:%M:%S")
 
     # Shu kunga belgilangan ketish vaqti (haftalik jadval bo'lsa — o'sha)
-    _arrive_time, leave_time = times_for_day(employee, now)
+    _arrive_time, leave_time = times_for_day(worker, now)
 
     # Belgilangan vaqtdan oldin ketdimi?
     left_early = False
@@ -955,7 +1016,7 @@ async def handle_leave_location(message: Message, state: FSMContext, is_update: 
             early_minutes = ceil((leave_dt - now).total_seconds() / 60)
 
     if not record_checkout(
-        employee_id, left, message.location.latitude, message.location.longitude
+        worker_id, left, message.location.latitude, message.location.longitude
     ):
         await state.clear()
         await message.answer(ALREADY_LEFT, reply_markup=menu)
@@ -998,12 +1059,9 @@ async def handle_leave_location(message: Message, state: FSMContext, is_update: 
         f"🕒 Ketgan vaqti: {left}\n"
         f"{status}"
     )
-    try:
-        await message.bot.send_message(GROUP_CHAT_ID, notice)
-    except TelegramAPIError:
-        logger.exception("Guruhga (%s) ketish xabari yuborilmadi", GROUP_CHAT_ID)
+    await notify_group(message.bot, notice)
 
-    # Adminlarga — aniq lokatsiya (xarita nuqtasi) + ish joyidan masofa
+    # Adminlarga — aniq lokatsiya (xarita nuqtasi) + markazdan masofa
     admin_notice = notice + f"\n📏 Ish joyidan: taxminan {int(real_dist)} metr"
     for admin_id in ADMIN_IDS:
         try:
@@ -1015,31 +1073,18 @@ async def handle_leave_location(message: Message, state: FSMContext, is_update: 
             logger.exception("Adminga (%s) ketish xabari yuborilmadi", admin_id)
 
 
-@employee_router.message(F.location)
-async def handle_location(message: Message, is_update: bool = False):
-    """Kelish lokatsiyasi. (Ketish lokatsiyasi — yuqoridagi LeaveFlow holatida.)
-
-    is_update=True bo'lsa — bu birinchi joylashuv emas, balki JONLI joylashuvning
-    keyingi yangilanishi (Telegram'ning edited_message'i). GPS ilk lahzada
-    noaniq bo'lishi mumkin (ayniqsa bino ichida) — vaqt o'tib aniqlik oshadi va
-    keyingi yangilanish ish joyi radiusiga tushishi mumkin. Shu sabab ishchi
-    qayta tugma bosmasdan, faqat joylashuvni ulashib turishning o'zi kifoya:
-    har bir yangilanishda qayta tekshiramiz. Lekin hali ham uzoq bo'lsa,
-    ishchini har necha soniyada "uzoqdasiz" xabari bilan bezovta qilmaymiz —
-    faqat birinchi urinishda va muvaffaqiyatli bo'lganda javob yozamiz."""
-    employee = get_employee(message.from_user.id)
-    if not employee:
-        if is_update:
-            return
+@worker_router.message(F.location)
+async def handle_location(message: Message):
+    """Kelish lokatsiyasi. (Ketish lokatsiyasi — yuqoridagi LeaveFlow holatida.)"""
+    worker = get_worker(message.from_user.id)
+    if not worker:
         await message.answer(not_registered_text(message.from_user.id))
         return
 
-    employee_id, first_name, last_name = employee[0], employee[2], employee[3]
+    worker_id, first_name, last_name = worker[0], worker[2], worker[3]
 
-    if has_checked_in_today(employee_id):
-        if is_update:
-            return
-        if has_checked_out_today(employee_id):
+    if has_checked_in_today(worker_id):
+        if has_checked_out_today(worker_id):
             await message.answer(ALREADY_LEFT)
         else:
             await message.answer(
@@ -1051,31 +1096,24 @@ async def handle_location(message: Message, is_update: bool = False):
 
     problem = location_problem(message)
     if problem:
-        if is_update:
-            return
         await message.answer(problem, reply_markup=menu_kb(message.from_user))
         return
 
     real_dist, tolerance, dist = location_check(message.location)
     radius = get_radius()
     if dist > radius:
-        logger.info(
-            "Lokatsiya rad etildi (%s): employee_id=%s, masofa=%.0fm, xatolik=%.0fm, "
-            "koordinata=%s,%s",
-            "yangilanish" if is_update else "birinchi", employee_id, real_dist,
-            message.location.horizontal_accuracy or 0,
-            message.location.latitude, message.location.longitude,
-        )
-        if is_update:
-            # Jonli joylashuv hali ham keladi — GPS to'g'rilanishi mumkin,
-            # keyingi yangilanishda qaytadan tekshiramiz. Hozircha jim turamiz.
-            return
         await message.answer(
             too_far_text(
                 "🙈 <b>Siz hali ish joyiga yetib kelmagansiz.</b>",
                 real_dist, tolerance, radius,
             ),
             reply_markup=menu_kb(message.from_user),
+        )
+        logger.info(
+            "Lokatsiya rad etildi: worker_id=%s, masofa=%.0fm, xatolik=%.0fm, "
+            "koordinata=%s,%s",
+            worker_id, real_dist, message.location.horizontal_accuracy or 0,
+            message.location.latitude, message.location.longitude,
         )
         return
 
@@ -1084,7 +1122,7 @@ async def handle_location(message: Message, is_update: bool = False):
     rates = get_fine_rates()  # admin o'zgartirgan joriy jarima sozlamalari
 
     # Shu hafta kuniga belgilangan vaqt (haftalik jadval bo'lsa — o'sha, aks holda standart)
-    scheduled_time, leave_time = times_for_day(employee, now)
+    scheduled_time, leave_time = times_for_day(worker, now)
 
     excessive = False
     if scheduled_time is None:
@@ -1101,7 +1139,7 @@ async def handle_location(message: Message, is_update: bool = False):
     # Jarima hisoblangan kech daqiqalar (chegarada to'xtaydi)
     charged_late = min(late_minutes, rates["late_cap"])
 
-    if not record_attendance(employee_id, arrived, is_late, late_minutes,
+    if not record_attendance(worker_id, arrived, is_late, late_minutes,
                              early_minutes, fine_amount, scheduled_time):
         await message.answer(ALREADY_CHECKED)
         return
@@ -1113,8 +1151,8 @@ async def handle_location(message: Message, is_update: bool = False):
             f"Belgilangan vaqtdan {format_minutes(late_minutes)} kech keldi "
             f"({rates['late_cap']} daqiqadan ortiq)"
         )
-        add_mark(employee_id, "ogohlantirish", reason, 0)
-        strikes = count_marks(employee_id, "ogohlantirish")  # shu ogohlantirish ham hisobga olindi
+        add_mark(worker_id, "ogohlantirish", reason, 0)
+        strikes = count_marks(worker_id, "ogohlantirish")  # shu ogohlantirish ham hisobga olindi
         remaining = rates["strikes"] - strikes
         warning_text = (
             "⚠️ <b>Ogohlantirish!</b>\n"
@@ -1151,10 +1189,7 @@ async def handle_location(message: Message, is_update: bool = False):
         if excessive:
             group_text += "\n⚠️ Keragidan ortiq kech qoldi — ogohlantirish berildi."
 
-    try:
-        await message.bot.send_message(GROUP_CHAT_ID, group_text)
-    except TelegramAPIError:
-        logger.exception("Guruhga (%s) xabar yuborib bo'lmadi", GROUP_CHAT_ID)
+    await notify_group(message.bot, group_text)
 
     # Har bir adminga alohida — aniq lokatsiya (xarita nuqtasi) + qisqacha xabar:
     # ism-familiya, kelgan vaqt va (agar kech qolgan bo'lsa) necha daqiqa kechikkani
@@ -1206,37 +1241,9 @@ async def handle_location(message: Message, is_update: bool = False):
         await message.answer(warning_text)
 
 
-@employee_router.edited_message(StateFilter(LeaveFlow.location), F.location)
-async def handle_leave_location_update(message: Message, state: FSMContext):
-    """Jonli joylashuv Telegram'da har necha soniyada yangilanadi va bot bu
-    yangilanishlarni "edited_message" sifatida oladi (yangi "message" sifatida
-    emas). Ilgari bot faqat birinchi joylashuvni ko'rar edi — agar o'sha lahzada
-    GPS hali aniq bo'lmasa (masalan bino ichida), ishchi qayta "🏠 Ketyapman"ni
-    bosib joylashuvni qaytadan boshlashi kerak edi. Endi har bir yangilanishda
-    qayta tekshiriladi — GPS to'g'rilanishi bilanoq avtomatik qabul qilinadi.
-
-    MUHIM: bu yangilanish faqat ANIQ SHU "Ketyapman" urinishida yuborilgan
-    joylashuv xabariga tegishli bo'lishi kerak. Aks holda, agar ishchining
-    "Keldim" paytida boshlagan jonli joylashuvi hali tugamagan (masalan,
-    bir necha soatga ulashgan) bo'lsa, o'sha eski ulashuvning navbatdagi
-    yangilanishi bu yerga tushib, ishchi hech narsa yubormasdan turib
-    "Ketyapman" avtomatik bajarilib ketardi — foydalanuvchiga xuddi tugma
-    bosilishi bilan darhol "Xayr" deyilayotgandek tuyulardi."""
-    data = await state.get_data()
-    if data.get("leave_msg_id") != message.message_id:
-        return
-    await handle_leave_location(message, state, is_update=True)
-
-
-@employee_router.edited_message(F.location)
-async def handle_location_update(message: Message):
-    """Kelish uchun ham xuddi shunday — izoh yuqorida."""
-    await handle_location(message, is_update=True)
-
-
-@employee_router.message(F.text == BTN_STATS)
+@worker_router.message(F.text == BTN_STATS)
 async def handle_stats_menu(message: Message):
-    if not get_employee(message.from_user.id):
+    if not get_worker(message.from_user.id):
         await message.answer(not_registered_text(message.from_user.id))
         return
 
@@ -1246,10 +1253,10 @@ async def handle_stats_menu(message: Message):
     )
 
 
-@employee_router.callback_query(F.data.in_({"stats_day", "stats_week", "stats_month"}))
+@worker_router.callback_query(F.data.in_({"stats_day", "stats_week", "stats_month"}))
 async def handle_stats_callback(callback: CallbackQuery):
-    employee = get_employee(callback.from_user.id)
-    if not employee:
+    worker = get_worker(callback.from_user.id)
+    if not worker:
         await callback.answer("Siz ro'yxatdan o'tmagansiz.", show_alert=True)
         return
 
@@ -1263,34 +1270,49 @@ async def handle_stats_callback(callback: CallbackQuery):
         date_from, period_label = today_date.replace(day=1), "Shu oydagi"
 
     records = db(
-        "SELECT is_late, late_minutes, fine_amount FROM attendance "
-        "WHERE employee_id = ? AND attendance_date BETWEEN ? AND ?",
-        (employee[0], date_from.isoformat(), today_date.isoformat()), fetch="all",
+        "SELECT is_late, late_minutes FROM attendance "
+        "WHERE worker_id = ? AND attendance_date BETWEEN ? AND ?",
+        (worker[0], date_from.isoformat(), today_date.isoformat()), fetch="all",
     )
-
     total_days = len(records)
-    late_count = sum(1 for is_late, _, _ in records if is_late)
-    total_late_minutes = sum(m for is_late, m, _ in records if is_late)
-    fined_days = sum(1 for _, _, fine in records if fine)
-    total_fine = sum(fine for _, _, fine in records)
+    late_count = sum(1 for is_late, _ in records if is_late)
+    total_late_minutes = sum(m for is_late, m in records if is_late)
 
-    if total_days == 0:
+    # Kechikish jarimalari + admin bergan jarimalar — sababi va summasi bilan
+    fines = collect_fine_entries(worker[0], date_from, today_date)
+    late_total = sum(f[3] for f in fines if f[4] == "late")
+    manual_total = sum(f[3] for f in fines if f[4] == "manual")
+    bonuses = collect_bonus_entries(worker[0], date_from, today_date)
+    bonus_total = sum(b[3] for b in bonuses)
+
+    if total_days == 0 and not fines and not bonuses:
         text = f"📊 <b>{period_label} natijalar</b>\n{LINE}\nBu davrda hali yozuv yo'q 🙈"
     else:
-        text = (
-            f"📊 <b>{period_label} natijalar</b>\n{LINE}\n"
-            f"✅ Kelgan kunlar: <b>{total_days}</b>\n"
-            f"🔴 Kech qolgan kunlar: <b>{late_count}</b>\n"
-        )
-        if late_count:
-            text += f"⏰ Jami kechikish: <b>{format_minutes(total_late_minutes)}</b>\n"
-        if total_fine:
+        text = f"📊 <b>{period_label} natijalar</b>\n{LINE}\n"
+        if total_days:
             text += (
-                f"💰 Jarimali kunlar: <b>{fined_days}</b>\n"
-                f"💰 Jami jarima: <b>{format_money(total_fine)}</b>"
+                f"✅ Kelgan kunlar: <b>{total_days}</b>\n"
+                f"🔴 Kech qolgan kunlar: <b>{late_count}</b>\n"
             )
+            if late_count:
+                text += f"⏰ Jami kechikish: <b>{format_minutes(total_late_minutes)}</b>\n"
+        else:
+            text += "Bu davrda kelish yozuvi yo'q.\n"
+
+        if fines:
+            text += f"💰 Jami jarima: <b>{format_money(late_total + manual_total)}</b>\n"
+            if late_total and manual_total:
+                text += (
+                    f"   • Kechikish uchun: {format_money(late_total)}\n"
+                    f"   • Boshqa jarimalar: {format_money(manual_total)}\n"
+                )
+            text += f"\n💸 <b>Jarimalar ro'yxati</b>\n{LINE}\n{format_mark_list(fines)}"
         else:
             text += "🎉 Jarima yo'q — barakalla!"
+
+        if bonuses:
+            text += f"\n\n🏅 Jami bonus: <b>{format_money(bonus_total)}</b>" if bonus_total else "\n"
+            text += f"\n🏅 <b>Bonuslar ro'yxati</b>\n{LINE}\n{format_mark_list(bonuses)}"
 
     try:
         await callback.message.edit_text(text)
@@ -1299,56 +1321,82 @@ async def handle_stats_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- Ishchining bonus va jazolari ----------
+# ---------- Ishchining bonus va jarimalari ----------
 
-@employee_router.message(F.text == BTN_MARKS)
+@worker_router.message(F.text.in_({BTN_MARKS, LEGACY_BTN_MARKS}))
 async def handle_my_marks(message: Message):
-    employee = get_employee(message.from_user.id)
-    if not employee:
+    worker = get_worker(message.from_user.id)
+    if not worker:
         await message.answer(not_registered_text(message.from_user.id))
         return
 
-    marks = get_marks(employee[0])
-    bonus_count = sum(1 for mark_type, _, _, _ in marks if mark_type == "bonus")
-    jazo_count = sum(1 for mark_type, _, _, _ in marks if mark_type == "jazo")
-    ogoh_count = sum(1 for mark_type, _, _, _ in marks if mark_type == "ogohlantirish")
+    marks = get_marks(worker[0])
+    ogoh_count = sum(1 for mark in marks if mark[0] == "ogohlantirish")
+    bonuses = collect_bonus_entries(worker[0])
+    bonus_total = sum(b[3] for b in bonuses)
+    fines = collect_fine_entries(worker[0])  # kechikish + admin bergan jarimalar
+    fine_total = sum(f[3] for f in fines)
 
-    await message.answer(
-        f"🏅 <b>Bonus va jazolarim</b>\n{LINE}\n"
-        f"🏅 Bonuslar: <b>{bonus_count}</b> ta\n"
-        f"⚠️ Jazolar: <b>{jazo_count}</b> ta\n"
-        f"🔔 Ogohlantirishlar: <b>{ogoh_count}</b> ta\n\n"
-        "Batafsil ko'rish uchun tugmani bosing 👇",
-        reply_markup=MARKS_KB,
+    text = (
+        f"🏅 <b>Bonus va jarimalarim</b>\n{LINE}\n"
+        f"🏅 Bonuslar: <b>{len(bonuses)}</b> ta"
     )
+    if bonus_total:
+        text += f" — jami <b>{format_money(bonus_total)}</b>"
+    text += f"\n💸 Jarimalar: <b>{len(fines)}</b> ta"
+    if fine_total:
+        text += f" — jami <b>{format_money(fine_total)}</b>"
+    text += (
+        f"\n🔔 Ogohlantirishlar: <b>{ogoh_count}</b> ta\n\n"
+        "Batafsil ko'rish uchun tugmani bosing 👇"
+    )
+    await message.answer(text, reply_markup=MARKS_KB)
 
 
-@employee_router.callback_query(F.data.in_({"my_bonus", "my_jazo", "my_ogoh"}))
+@worker_router.callback_query(F.data.in_({"my_bonus", "my_jarima", "my_jazo", "my_ogoh"}))
 async def handle_my_marks_detail(callback: CallbackQuery):
-    employee = get_employee(callback.from_user.id)
-    if not employee:
+    worker = get_worker(callback.from_user.id)
+    if not worker:
         await callback.answer("Siz ro'yxatdan o'tmagansiz.", show_alert=True)
         return
 
-    wanted = {"my_bonus": "bonus", "my_jazo": "jazo", "my_ogoh": "ogohlantirish"}[callback.data]
-    title = {
-        "bonus": "🏅 Bonuslaringiz",
-        "jazo": "⚠️ Jazolaringiz",
-        "ogohlantirish": "🔔 Ogohlantirishlaringiz",
-    }[wanted]
-    rows = [(reason, amount, date) for mark_type, reason, amount, date in get_marks(employee[0])
-            if mark_type == wanted]
+    # "my_jazo" — eski xabarlardagi tugma; endi u ham jarimalarni ochadi
+    wanted = {
+        "my_bonus": "bonus", "my_jarima": "jarima", "my_jazo": "jarima",
+        "my_ogoh": "ogohlantirish",
+    }[callback.data]
 
-    if not rows:
-        text = f"{title}\n{LINE}\nHozircha bunday yozuv yo'q."
-        if wanted != "bonus":
-            text += " Shunday davom eting! 🎉"
+    if wanted == "bonus":
+        bonuses = collect_bonus_entries(worker[0])
+        if not bonuses:
+            text = f"🏅 Bonuslaringiz\n{LINE}\nHozircha bonus yo'q. Harakat qiling — sizda hammasi bor! 💪"
+        else:
+            total = sum(b[3] for b in bonuses)
+            head = f"🏅 Bonuslaringiz — jami {len(bonuses)} ta"
+            if total:
+                head += f", <b>{format_money(total)}</b>"
+            text = f"{head}\n{LINE}\n{format_mark_list(bonuses, limit=25)}"
+    elif wanted == "jarima":
+        fines = collect_fine_entries(worker[0])
+        if not fines:
+            text = f"💸 Jarimalaringiz\n{LINE}\nHozircha jarima yo'q. Shunday davom eting! 🎉"
+        else:
+            total = sum(f[3] for f in fines)
+            text = (
+                f"💸 Jarimalaringiz — jami {len(fines)} ta, <b>{format_money(total)}</b>\n"
+                f"{LINE}\n{format_mark_list(fines, limit=25)}"
+            )
     else:
-        text = f"{title} — jami {len(rows)} ta\n{LINE}\n" + "\n".join(
-            f"{i}. <b>{date}</b>\n   {reason}"
-            + (f"\n   💰 {format_money(amount)}" if amount else "")
-            for i, (reason, amount, date) in enumerate(rows, 1)
-        )
+        title = "🔔 Ogohlantirishlaringiz"
+        rows = [(reason, date) for mark_type, reason, date, _amount in get_marks(worker[0])
+                if mark_type == wanted]
+        if not rows:
+            text = f"{title}\n{LINE}\nHozircha bunday yozuv yo'q. Shunday davom eting! 🎉"
+        else:
+            text = f"{title} — jami {len(rows)} ta\n{LINE}\n" + "\n".join(
+                f"{i}. <b>{date}</b>\n   {html.escape(reason, quote=False)}"
+                for i, (reason, date) in enumerate(rows, 1)
+            )
 
     try:
         await callback.message.edit_text(text, reply_markup=MARKS_KB)
@@ -1357,7 +1405,7 @@ async def handle_my_marks_detail(callback: CallbackQuery):
     await callback.answer()
 
 
-@employee_router.message(StateFilter(LeaveFlow.location))
+@worker_router.message(StateFilter(LeaveFlow.location))
 async def leave_wrong_input(message: Message):
     """Ketish holatida joylashuv o'rniga boshqa narsa yuborilsa — nima qilish kerakligini eslatamiz."""
     await message.answer(
@@ -1372,7 +1420,7 @@ async def leave_wrong_input(message: Message):
 # Admin buyruq yodlamaydi: tugmani bosadi, bot kerakli ma'lumotni
 # qadam-baqadam so'raydi. Har qadamda "❌ Bekor qilish" tugmasi bor.
 
-class AddEmployee(StatesGroup):
+class AddWorker(StatesGroup):
     tg_id = State()
     first_name = State()
     last_name = State()
@@ -1390,12 +1438,13 @@ class CustomReport(StatesGroup):
 
 
 class GiveBonus(StatesGroup):
-    reason = State()
-    amount = State()
+    reason = State()   # bonus sababi
+    amount = State()   # bonus summasi (so'mda)
 
 
-class GiveJazo(StatesGroup):
-    reason = State()
+class GiveFine(StatesGroup):
+    reason = State()   # sabab (tayyor ro'yxatdan tanlanmasa — yoziladi)
+    amount = State()   # jarima summasi (so'mda)
 
 
 class EditSchedule(StatesGroup):
@@ -1415,11 +1464,11 @@ async def cancel_action(message: Message, state: FSMContext):
     await message.answer("Bekor qilindi.", reply_markup=menu_kb(message.from_user))
 
 
-# ---------- Ishchi qo'shish (4 qadam) ----------
+# ---------- Ishchi qo'shish (5 qadam) ----------
 
 @panel_router.message(F.text == "➕ Ishchi qo'shish")
 async def add_step_start(message: Message, state: FSMContext):
-    await state.set_state(AddEmployee.tg_id)
+    await state.set_state(AddWorker.tg_id)
     await message.answer(
         "<b>1/5-qadam:</b> Ishchining Telegram ID raqamini yuboring.\n\n"
         "💡 IDni bilish oson: ishchi botga /start yozsa, bot unga ID raqamini "
@@ -1429,7 +1478,7 @@ async def add_step_start(message: Message, state: FSMContext):
     )
 
 
-@panel_router.message(AddEmployee.tg_id)
+@panel_router.message(AddWorker.tg_id)
 async def add_step_id(message: Message, state: FSMContext):
     # Forward qilingan xabardan IDni avtomatik olamiz
     sender = getattr(message.forward_origin, "sender_user", None)
@@ -1444,7 +1493,7 @@ async def add_step_id(message: Message, state: FSMContext):
         )
         return
 
-    existing = get_employee(tg_id)
+    existing = get_worker(tg_id)
     if existing:
         await state.clear()
         await message.answer(
@@ -1454,25 +1503,25 @@ async def add_step_id(message: Message, state: FSMContext):
         return
 
     await state.update_data(tg_id=tg_id)
-    await state.set_state(AddEmployee.first_name)
+    await state.set_state(AddWorker.first_name)
     await message.answer(f"ID qabul qilindi: <code>{tg_id}</code>\n\n<b>2/5-qadam:</b> Ismini yozing (masalan: Ali).")
 
 
-@panel_router.message(AddEmployee.first_name, F.text)
+@panel_router.message(AddWorker.first_name, F.text)
 async def add_step_first_name(message: Message, state: FSMContext):
     await state.update_data(first_name=message.text.strip())
-    await state.set_state(AddEmployee.last_name)
+    await state.set_state(AddWorker.last_name)
     await message.answer("<b>3/5-qadam:</b> Familiyasini yozing (masalan: Valiyev).")
 
 
-@panel_router.message(AddEmployee.last_name, F.text)
+@panel_router.message(AddWorker.last_name, F.text)
 async def add_step_last_name(message: Message, state: FSMContext):
     await state.update_data(last_name=message.text.strip())
-    await state.set_state(AddEmployee.sched_time)
+    await state.set_state(AddWorker.sched_time)
     await message.answer("<b>4/5-qadam:</b> Ishga kelish vaqtini yozing (masalan: 09:00).")
 
 
-@panel_router.message(AddEmployee.sched_time, F.text)
+@panel_router.message(AddWorker.sched_time, F.text)
 async def add_step_time(message: Message, state: FSMContext):
     sched_time = message.text.strip()
     if not TIME_RE.match(sched_time):
@@ -1480,14 +1529,14 @@ async def add_step_time(message: Message, state: FSMContext):
         return
 
     await state.update_data(sched_time=sched_time)
-    await state.set_state(AddEmployee.departure)
+    await state.set_state(AddWorker.departure)
     await message.answer(
-        "<b>5/5-qadam:</b> Ish joyidan ketish vaqtini yozing (masalan: 18:00).\n\n"
+        "<b>5/5-qadam:</b> Ishdan ketish vaqtini yozing (masalan: 18:00).\n\n"
         f"💡 O'tkazib yuborish uchun <code>-</code> yuboring — standart {DEFAULT_DEPARTURE} qo'yiladi."
     )
 
 
-@panel_router.message(AddEmployee.departure, F.text)
+@panel_router.message(AddWorker.departure, F.text)
 async def add_step_departure(message: Message, state: FSMContext):
     departure = message.text.strip()
     if departure == "-":
@@ -1499,13 +1548,14 @@ async def add_step_departure(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    if add_employee(data["tg_id"], data["first_name"], data["last_name"],
+    if add_worker(data["tg_id"], data["first_name"], data["last_name"],
                    data["sched_time"], departure):
         await message.answer(
             f"✅ <b>{data['first_name']} {data['last_name']}</b> ro'yxatga qo'shildi!\n"
+            f"{LINE}\n"
             f"🕘 Kelish vaqti: {data['sched_time']}\n"
             f"🕕 Ketish vaqti: {departure}\n\n"
-            "Endi u botga /start yozib, \"✅ Keldim\" tugmasidan foydalana oladi.\n"
+            f"Endi u botga /start yozib, <b>{BTN_ARRIVE}</b> tugmasidan foydalana oladi.\n"
             "💡 Hafta kunlariga alohida vaqt kerak bo'lsa — \"📋 Ishchilar ro'yxati\" "
             "dan 🗓 tugmasini bosing.",
             reply_markup=menu_kb(message.from_user),
@@ -1517,16 +1567,113 @@ async def add_step_departure(message: Message, state: FSMContext):
         )
 
 
+# ---------- Bugungi davomat (bir qarashda) ----------
+
+@panel_router.message(F.text == BTN_TODAY)
+async def show_today_attendance(message: Message):
+    """Faqat BUGUNGI kun: har bir ishchi kelgan/ketgan vaqti, necha daqiqa kech
+    kelgani, kechikish jarimasi va bugun olgan boshqa jarimalari (sabab + summa)."""
+    rows = db(
+        """
+        SELECT w.id, w.first_name, w.last_name, w.scheduled_time,
+               a.arrived_time, a.is_late, a.late_minutes, a.early_minutes,
+               a.fine_amount, a.left_time
+        FROM workers w
+        LEFT JOIN attendance a
+            ON a.worker_id = w.id AND a.attendance_date = ?
+        ORDER BY w.first_name, w.last_name
+        """,
+        (today(),), fetch="all",
+    )
+
+    if not rows:
+        await message.answer(
+            "Hozircha ishchilar ro'yxati bo'sh.\n"
+            "\"➕ Ishchi qo'shish\" tugmasi orqali birinchi ishchini qo'shing."
+        )
+        return
+
+    # Bugun admin bergan jarimalar va bonuslar: {worker_id: [(sabab, summa), ...]}
+    manual_fines: dict[int, list[tuple[str, int]]] = {}
+    day_bonuses: dict[int, list[tuple[str, int]]] = {}
+    for worker_id, mark_type, reason, amount in db(
+        "SELECT worker_id, mark_type, reason, amount FROM marks "
+        "WHERE mark_date = ? AND mark_type IN ('jarima', 'bonus') ORDER BY id",
+        (today(),), fetch="all",
+    ):
+        target = manual_fines if mark_type == "jarima" else day_bonuses
+        target.setdefault(worker_id, []).append((reason, amount))
+
+    lines = []
+    arrived_count = 0
+    left_count = 0
+    day_total_fine = 0
+    day_total_bonus = sum(a for items in day_bonuses.values() for _, a in items)
+    for (worker_id, first, last, sched, arrived, is_late, late_min, early_min,
+         fine, left) in rows:
+        name = f"{first} {last}"
+        late_fine = fine or 0
+        extra_fines = manual_fines.get(worker_id, [])
+        worker_total = late_fine + sum(amount for _, amount in extra_fines)
+        day_total_fine += worker_total
+
+        if arrived is None:
+            block = f"⚪️ <b>{name}</b> — hali kelmagan (belgilangan: {sched})"
+        else:
+            arrived_count += 1
+            if is_late:
+                status = f"🔴 {arrived[:5]} (kech: {format_minutes(late_min)})"
+            elif late_fine:
+                status = f"🟡 {arrived[:5]} (erta oynada: {format_minutes(early_min)})"
+            else:
+                status = f"🟢 {arrived[:5]}"
+
+            if left:
+                left_count += 1
+                status += f"   →   🏠 {left[:5]}"
+            else:
+                status += "   →   ⏳ hali ishda"
+
+            block = f"👤 <b>{name}</b>\n{status}"
+            if late_fine:
+                block += f"\n💰 Kechikish jarimasi: <b>{format_money(late_fine)}</b>"
+
+        for reason, amount in extra_fines:
+            money = format_money(amount) if amount else "summa belgilanmagan"
+            block += f"\n💸 Jarima: {html.escape(reason, quote=False)} — <b>{money}</b>"
+        if late_fine and extra_fines:
+            block += f"\n🧾 Jami jarima: <b>{format_money(worker_total)}</b>"
+        for reason, amount in day_bonuses.get(worker_id, []):
+            money = format_money(amount) if amount else "summa belgilanmagan"
+            block += f"\n🏅 Bonus: {html.escape(reason, quote=False)} — <b>{money}</b>"
+
+        lines.append(block)
+
+    today_label = datetime.now(TZ).strftime("%d.%m.%Y")
+    text = (
+        f"📅 <b>Bugungi davomat</b> — {today_label}\n"
+        f"{LINE}\n"
+        f"✅ Kelganlar: <b>{arrived_count}/{len(rows)}</b>   "
+        f"🏠 Ketganlar: <b>{left_count}</b>\n"
+    )
+    if day_total_fine:
+        text += f"💰 Bugungi jami jarima: <b>{format_money(day_total_fine)}</b>\n"
+    if day_total_bonus:
+        text += f"🏅 Bugungi jami bonus: <b>{format_money(day_total_bonus)}</b>\n"
+    text += f"{LINE}\n" + "\n\n".join(lines)
+    await send_long(message, text)
+
+
 # ---------- Ishchilar ro'yxati (vaqt o'zgartirish / o'chirish) ----------
 
 @panel_router.message(F.text == "📋 Ishchilar ro'yxati")
-async def show_employees_list(message: Message):
-    employees = db(
+async def show_workers_list(message: Message):
+    workers = db(
         "SELECT first_name, last_name, scheduled_time, departure_time, telegram_id "
-        "FROM employees ORDER BY first_name, last_name",
+        "FROM workers ORDER BY first_name, last_name",
         fetch="all",
     )
-    if not employees:
+    if not workers:
         await message.answer(
             "Hozircha ishchilar ro'yxati bo'sh.\n"
             "\"➕ Ishchi qo'shish\" tugmasi orqali birinchi ishchini qo'shing."
@@ -1535,18 +1682,19 @@ async def show_employees_list(message: Message):
 
     # Har bir ishchi uchun: ⏰ — vaqt, 🗓 — haftalik jadval, 🗑 — o'chirish
     rows = []
-    for first, last, sched, departure, tg_id in employees:
+    for first, last, sched, departure, tg_id in workers:
         rows.append([InlineKeyboardButton(
             text=f"👤 {first} {last} — {sched}/{departure}", callback_data=f"time:{tg_id}"
         )])
         rows.append([
             InlineKeyboardButton(text="⏰ Vaqt", callback_data=f"time:{tg_id}"),
             InlineKeyboardButton(text="🗓 Jadval", callback_data=f"sched:{tg_id}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"del:{tg_id}"),
+            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"del:{tg_id}"),
         ])
 
     await message.answer(
-        f"📋 Ishchilar ro'yxati ({len(employees)} ta):\n"
+        f"📋 <b>Ishchilar ro'yxati</b> ({len(workers)} ta)\n"
+        f"{LINE}\n"
         "Nom yonidagi raqamlar — kelish/ketish vaqti.\n\n"
         "⏰ — standart kelish va ketish vaqtini o'zgartirish\n"
         "🗓 — hafta kunlariga alohida vaqt belgilash\n"
@@ -1558,16 +1706,16 @@ async def show_employees_list(message: Message):
 @panel_router.callback_query(F.data.startswith("time:"))
 async def change_time_start(callback: CallbackQuery, state: FSMContext):
     tg_id = int(callback.data.split(":")[1])
-    employee = get_employee(tg_id)
-    if not employee:
+    worker = get_worker(tg_id)
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
     await state.update_data(tg_id=tg_id)
     await state.set_state(ChangeTime.sched_time)
     await callback.message.answer(
-        f"<b>{employee[2]} {employee[3]}</b> uchun yangi <b>kelish</b> vaqtini yozing "
-        f"(hozirgisi: {employee[4]}).\nMasalan: 09:30",
+        f"<b>{worker[2]} {worker[3]}</b> uchun yangi <b>kelish</b> vaqtini yozing "
+        f"(hozirgisi: {worker[4]}).\nMasalan: 09:30",
         reply_markup=CANCEL_KB,
     )
     await callback.answer()
@@ -1581,12 +1729,12 @@ async def change_time_arrive(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    employee = get_employee(data["tg_id"])
+    worker = get_worker(data["tg_id"])
     await state.update_data(sched_time=sched_time)
     await state.set_state(ChangeTime.departure)
     await message.answer(
         f"Endi <b>ketish</b> vaqtini yozing "
-        f"(hozirgisi: {employee[5] if employee else DEFAULT_DEPARTURE}).\nMasalan: 18:00"
+        f"(hozirgisi: {worker[5] if worker else DEFAULT_DEPARTURE}).\nMasalan: 18:00"
     )
 
 
@@ -1601,7 +1749,7 @@ async def change_time_save(message: Message, state: FSMContext):
     await state.clear()
 
     ok = db(
-        "UPDATE employees SET scheduled_time = ?, departure_time = ? WHERE telegram_id = ?",
+        "UPDATE workers SET scheduled_time = ?, departure_time = ? WHERE telegram_id = ?",
         (data["sched_time"], departure, data["tg_id"]),
     ) > 0
     await message.answer(
@@ -1614,8 +1762,8 @@ async def change_time_save(message: Message, state: FSMContext):
 @panel_router.callback_query(F.data.startswith("del:"))
 async def delete_confirm(callback: CallbackQuery):
     tg_id = int(callback.data.split(":")[1])
-    employee = get_employee(tg_id)
-    if not employee:
+    worker = get_worker(tg_id)
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
@@ -1624,7 +1772,7 @@ async def delete_confirm(callback: CallbackQuery):
         InlineKeyboardButton(text="❌ Yo'q", callback_data="delno"),
     ]])
     await callback.message.answer(
-        f"<b>{employee[2]} {employee[3]}</b> ro'yxatdan o'chirilsinmi?", reply_markup=kb
+        f"<b>{worker[2]} {worker[3]}</b> ro'yxatdan o'chirilsinmi?", reply_markup=kb
     )
     await callback.answer()
 
@@ -1632,7 +1780,7 @@ async def delete_confirm(callback: CallbackQuery):
 @panel_router.callback_query(F.data.startswith("delok:"))
 async def delete_do(callback: CallbackQuery):
     tg_id = int(callback.data.split(":")[1])
-    ok = db("DELETE FROM employees WHERE telegram_id = ?", (tg_id,)) > 0
+    ok = db("DELETE FROM workers WHERE telegram_id = ?", (tg_id,)) > 0
     await callback.message.edit_text(
         "✅ Ishchi ro'yxatdan o'chirildi." if ok else "⚠️ Bunday ishchi topilmadi."
     )
@@ -1649,11 +1797,11 @@ async def delete_cancel(callback: CallbackQuery):
 # Masalan: dushanba/chorshanba/juma — 12:00, seshanba/payshanba/shanba — 13:00.
 # Admin avval kunlarni belgilaydi, keyin o'sha kunlarga vaqt kiritadi.
 
-def schedule_text(employee, selected: set[int]) -> str:
+def schedule_text(worker, selected: set[int]) -> str:
     chosen = ", ".join(WEEKDAYS[weekday] for weekday in sorted(selected)) or "hech qaysi"
     return (
-        f"🗓 <b>{employee[2]} {employee[3]}</b> — haftalik jadval\n\n"
-        f"{format_week_schedule(employee)}\n\n"
+        f"🗓 <b>{worker[2]} {worker[3]}</b> — haftalik jadval\n\n"
+        f"{format_week_schedule(worker)}\n\n"
         f"<b>Belgilangan kunlar:</b> {chosen}\n\n"
         "Kunlarni bosib belgilang, so'ng pastdagi amallardan birini tanlang."
     )
@@ -1661,13 +1809,13 @@ def schedule_text(employee, selected: set[int]) -> str:
 
 async def show_schedule_editor(callback: CallbackQuery, state: FSMContext, edit: bool = True):
     data = await state.get_data()
-    employee = get_employee(data["tg_id"])
-    if not employee:
+    worker = get_worker(data["tg_id"])
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
     selected = set(data.get("days", []))
-    text, kb = schedule_text(employee, selected), schedule_kb(selected)
+    text, kb = schedule_text(worker, selected), schedule_kb(selected)
     if edit:
         try:
             await callback.message.edit_text(text, reply_markup=kb)
@@ -1680,7 +1828,7 @@ async def show_schedule_editor(callback: CallbackQuery, state: FSMContext, edit:
 @panel_router.callback_query(F.data.startswith("sched:"))
 async def schedule_start(callback: CallbackQuery, state: FSMContext):
     tg_id = int(callback.data.split(":")[1])
-    if not get_employee(tg_id):
+    if not get_worker(tg_id):
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
@@ -1744,20 +1892,20 @@ async def schedule_save_leave(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
 
-    employee = get_employee(data["tg_id"])
-    if not employee:
+    worker = get_worker(data["tg_id"])
+    if not worker:
         await message.answer("⚠️ Bu ishchi topilmadi.", reply_markup=menu_kb(message.from_user))
         return
 
     for weekday in data["days"]:
-        set_day_schedule(employee[0], weekday, data["arrive"], leave)
+        set_day_schedule(worker[0], weekday, data["arrive"], leave)
 
     days_text = ", ".join(WEEKDAYS[weekday] for weekday in data["days"])
     await message.answer(
-        f"✅ <b>{employee[2]} {employee[3]}</b> uchun saqlandi:\n"
+        f"✅ <b>{worker[2]} {worker[3]}</b> uchun saqlandi:\n"
         f"📅 {days_text}\n"
         f"🕘 Kelish: {data['arrive']}   🕕 Ketish: {leave or '—'}\n\n"
-        f"<b>Yangi jadval:</b>\n{format_week_schedule(get_employee(data['tg_id']))}",
+        f"<b>Yangi jadval:</b>\n{format_week_schedule(get_worker(data['tg_id']))}",
         reply_markup=menu_kb(message.from_user),
     )
 
@@ -1769,13 +1917,13 @@ async def schedule_set_dayoff(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Avval kamida bitta kunni belgilang.", show_alert=True)
         return
 
-    employee = get_employee(data["tg_id"])
-    if not employee:
+    worker = get_worker(data["tg_id"])
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
     for weekday in data["days"]:
-        set_day_schedule(employee[0], weekday, None, None)
+        set_day_schedule(worker[0], weekday, None, None)
 
     await state.update_data(days=[])
     await show_schedule_editor(callback, state)
@@ -1785,20 +1933,20 @@ async def schedule_set_dayoff(callback: CallbackQuery, state: FSMContext):
 @panel_router.callback_query(EditSchedule.picking, F.data == "sclear")
 async def schedule_clear(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    employee = get_employee(data["tg_id"])
-    if not employee:
+    worker = get_worker(data["tg_id"])
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
-    clear_week_schedule(employee[0])
+    clear_week_schedule(worker[0])
     await state.update_data(days=[])
     await show_schedule_editor(callback, state)
     await callback.answer("Jadval tozalandi — standart vaqt ishlatiladi.")
 
 
-# ---------- Bonus va jazo berish ----------
+# ---------- Bonus va jarima berish ----------
 
-async def notify_employee(bot, tg_id: int, text: str) -> bool:
+async def notify_worker(bot, tg_id: int, text: str) -> bool:
     """Ishchiga shaxsiy xabar yuboradi. U botni bloklagan bo'lsa False."""
     try:
         await bot.send_message(tg_id, text)
@@ -1809,43 +1957,46 @@ async def notify_employee(bot, tg_id: int, text: str) -> bool:
 
 
 async def save_and_notify_mark(
-    message: Message, admin: User, tg_id: int, mark_type: str, reason: str, amount: int = 0
+    message: Message, admin: User, tg_id: int, mark_type: str, reason: str,
+    amount: int = 0,
 ):
-    """Bonus/jazoni bazaga yozadi, ishchini xabardor qiladi, adminga tasdiq beradi.
-    `admin` alohida uzatiladi: callback ichidagi xabarning muallifi — botning o'zi."""
-    employee = get_employee(tg_id)
-    if not employee:
+    """Bonus/jarimani bazaga yozadi, ishchini xabardor qiladi, adminga tasdiq beradi.
+    `admin` alohida uzatiladi: callback ichidagi xabarning muallifi — botning o'zi.
+    `amount` — faqat jarima uchun (so'mda)."""
+    worker = get_worker(tg_id)
+    if not worker:
         await message.answer("⚠️ Bu ishchi topilmadi.", reply_markup=menu_kb(admin))
         return
 
-    add_mark(employee[0], mark_type, reason, admin.id, amount)
-    amount_line = f"💰 Summa: {format_money(amount)}\n" if amount else ""
+    add_mark(worker[0], mark_type, reason, admin.id, amount)
+    safe_reason = html.escape(reason, quote=False)
 
     if mark_type == "bonus":
         note = (
             "🏅 <b>Sizga bonus berildi!</b>\n"
             f"{LINE}\n"
-            f"📝 Sabab: {reason}\n"
-            f"{amount_line}"
+            f"📝 Sabab: {safe_reason}\n"
+            f"💰 Summa: <b>{format_money(amount)}</b>\n"
             f"📅 Sana: {today()}\n\n"
             "Ajoyib ish, shunday davom eting! 🎉"
         )
     else:
         note = (
-            "⚠️ <b>Sizga jazo berildi.</b>\n"
+            "💸 <b>Sizga jarima yozildi.</b>\n"
             f"{LINE}\n"
-            f"📝 Sabab: {reason}\n"
-            f"{amount_line}"
+            f"📝 Sabab: {safe_reason}\n"
+            f"💰 Summa: <b>{format_money(amount)}</b>\n"
             f"📅 Sana: {today()}\n\n"
             "Iltimos, bunday holat qaytarilmasligiga e'tibor bering."
         )
 
-    delivered = await notify_employee(message.bot, tg_id, note)
-    label = "🏅 Bonus" if mark_type == "bonus" else "⚠️ Jazo"
+    delivered = await notify_worker(message.bot, tg_id, note)
+    label = "🏅 Bonus" if mark_type == "bonus" else "💸 Jarima"
+    amount_line = f"💰 Summa: {format_money(amount)}\n" if amount else ""
     await message.answer(
         f"✅ {label} yozib qo'yildi.\n"
-        f"👤 {employee[2]} {employee[3]}\n"
-        f"📝 Sabab: {reason}\n"
+        f"👤 {worker[2]} {worker[3]}\n"
+        f"📝 Sabab: {safe_reason}\n"
         f"{amount_line}\n"
         + ("📨 Ishchiga xabar yuborildi."
            if delivered else
@@ -1855,10 +2006,13 @@ async def save_and_notify_mark(
     )
 
 
+MARK_MAX_AMOUNT = 50_000_000  # bitta bonus/jarima uchun eng katta summa (xato kiritishdan himoya)
+
+
 @panel_router.message(F.text == "🏅 Bonus berish")
-async def bonus_pick_employee(message: Message, state: FSMContext):
+async def bonus_pick_worker(message: Message, state: FSMContext):
     await state.clear()
-    kb = employees_pick_kb("bon")
+    kb = workers_pick_kb("bon")
     if kb is None:
         await message.answer("Avval ishchi qo'shing.")
         return
@@ -1868,15 +2022,15 @@ async def bonus_pick_employee(message: Message, state: FSMContext):
 @panel_router.callback_query(F.data.startswith("bon:"))
 async def bonus_ask_reason(callback: CallbackQuery, state: FSMContext):
     tg_id = int(callback.data.split(":")[1])
-    employee = get_employee(tg_id)
-    if not employee:
+    worker = get_worker(tg_id)
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
     await state.set_state(GiveBonus.reason)
     await state.update_data(tg_id=tg_id)
     await callback.message.answer(
-        f"🏅 <b>{employee[2]} {employee[3]}</b> uchun bonus sababini yozing.\n\n"
+        f"🏅 <b>{worker[2]} {worker[3]}</b> uchun bonus sababini yozing.\n\n"
         "Masalan: <i>Oylik reja 120% bajarildi</i>",
         reply_markup=CANCEL_KB,
     )
@@ -1884,29 +2038,33 @@ async def bonus_ask_reason(callback: CallbackQuery, state: FSMContext):
 
 
 @panel_router.message(GiveBonus.reason, F.text)
-async def bonus_ask_amount(message: Message, state: FSMContext):
+async def bonus_save(message: Message, state: FSMContext):
     reason = message.text.strip()
     if len(reason) < 3:
         await message.answer("Sabab juda qisqa. Iltimos, batafsilroq yozing.")
         return
 
-    await state.update_data(reason=reason)
+    data = await state.get_data()
     await state.set_state(GiveBonus.amount)
+    await state.update_data(tg_id=data["tg_id"], reason=reason)
     await message.answer(
-        "💰 Bonus summasini so'mda yozing (masalan: <code>150000</code>).\n"
-        "Agar summasiz, faqat rag'batlantirish sifatida bo'lsa — <code>0</code> deb yozing.",
+        f"📝 Sabab: <b>{html.escape(reason, quote=False)}</b>\n\n"
+        "💰 Bonus summasini so'mda yozing.\n"
+        "Masalan: <i>100000</i> yoki <i>100 000</i>",
         reply_markup=CANCEL_KB,
     )
 
 
 @panel_router.message(GiveBonus.amount, F.text)
-async def bonus_save(message: Message, state: FSMContext):
+async def bonus_amount_written(message: Message, state: FSMContext):
     amount = parse_number(message.text)
-    if amount is None or not 0 <= amount <= 50_000_000:
+    if amount is None or amount <= 0:
+        await message.answer("🙈 Summani faqat raqam bilan yozing, masalan: <i>100000</i>")
+        return
+    if amount > MARK_MAX_AMOUNT:
         await message.answer(
-            "🙈 Noto'g'ri summa. 0 dan 50 000 000 gacha bo'lgan butun son yuboring "
-            "(masalan: <code>150000</code>), yoki summasiz bo'lsa <code>0</code>.\n"
-            "Yoki \"❌ Bekor qilish\" ni bosing."
+            f"🙈 Summa juda katta. Eng ko'pi {format_money(MARK_MAX_AMOUNT)} bo'lishi mumkin — "
+            "raqamni tekshirib qaytadan yozing."
         )
         return
 
@@ -1917,82 +2075,118 @@ async def bonus_save(message: Message, state: FSMContext):
     )
 
 
-@panel_router.message(F.text == "⚠️ Jazo berish")
-async def jazo_pick_employee(message: Message, state: FSMContext):
+@panel_router.message(F.text.in_({BTN_GIVE_FINE, LEGACY_BTN_GIVE_FINE}))
+async def fine_pick_worker(message: Message, state: FSMContext):
     await state.clear()
-    kb = employees_pick_kb("jaz")
+    kb = workers_pick_kb("fpick")
     if kb is None:
         await message.answer("Avval ishchi qo'shing.")
         return
-    await message.answer("⚠️ Kimga jazo bermoqchisiz?", reply_markup=kb)
+    await message.answer("💸 Kimga jarima bermoqchisiz?", reply_markup=kb)
 
 
-@panel_router.callback_query(F.data.startswith("jaz:"))
-async def jazo_pick_reason(callback: CallbackQuery, state: FSMContext):
+# "jaz:" — jazo nomi bilan yuborilgan eski xabarlardagi tugmalar uchun
+@panel_router.callback_query(F.data.startswith(("fpick:", "jaz:")))
+async def fine_pick_reason(callback: CallbackQuery, state: FSMContext):
     tg_id = int(callback.data.split(":")[1])
-    employee = get_employee(tg_id)
-    if not employee:
+    worker = get_worker(tg_id)
+    if not worker:
         await callback.answer("Bu ishchi topilmadi.", show_alert=True)
         return
 
     await state.update_data(tg_id=tg_id)
     rows = [
         [InlineKeyboardButton(text=reason, callback_data=f"jr:{tg_id}:{index}")]
-        for index, reason in enumerate(JAZO_REASONS)
+        for index, reason in enumerate(FINE_REASONS)
     ]
     rows.append([InlineKeyboardButton(text="✏️ Boshqa sabab", callback_data=f"jr:{tg_id}:x")])
     await callback.message.answer(
-        f"⚠️ <b>{employee[2]} {employee[3]}</b> uchun jazo sababini tanlang:",
+        f"💸 <b>{worker[2]} {worker[3]}</b> uchun jarima sababini tanlang yoki o'zingiz yozing:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
 
 
+async def ask_fine_amount(message: Message, state: FSMContext, tg_id: int, reason: str):
+    """Sabab tayyor bo'ldi — endi jarima summasini so'raymiz."""
+    await state.set_state(GiveFine.amount)
+    await state.update_data(tg_id=tg_id, reason=reason)
+    await message.answer(
+        f"📝 Sabab: <b>{html.escape(reason, quote=False)}</b>\n\n"
+        "💰 Jarima summasini so'mda yozing.\n"
+        "Masalan: <i>50000</i> yoki <i>50 000</i>",
+        reply_markup=CANCEL_KB,
+    )
+
+
 @panel_router.callback_query(F.data.startswith("jr:"))
-async def jazo_save(callback: CallbackQuery, state: FSMContext):
+async def fine_reason_chosen(callback: CallbackQuery, state: FSMContext):
     _, tg_id_text, choice = callback.data.split(":")
     tg_id = int(tg_id_text)
 
     if choice == "x":
-        await state.set_state(GiveJazo.reason)
+        await state.set_state(GiveFine.reason)
         await state.update_data(tg_id=tg_id)
-        await callback.message.answer("Jazo sababini yozing:", reply_markup=CANCEL_KB)
+        await callback.message.answer("Jarima sababini yozing:", reply_markup=CANCEL_KB)
         await callback.answer()
         return
 
-    await state.clear()
+    index = int(choice)
+    if index >= len(FINE_REASONS):
+        await callback.answer("Bu sabab endi ro'yxatda yo'q. Qaytadan boshlang.", show_alert=True)
+        return
+
     await callback.answer()
-    await save_and_notify_mark(
-        callback.message, callback.from_user, tg_id, "jazo", JAZO_REASONS[int(choice)]
-    )
+    await ask_fine_amount(callback.message, state, tg_id, FINE_REASONS[index])
 
 
-@panel_router.message(GiveJazo.reason, F.text)
-async def jazo_save_custom(message: Message, state: FSMContext):
+@panel_router.message(GiveFine.reason, F.text)
+async def fine_reason_written(message: Message, state: FSMContext):
     reason = message.text.strip()
     if len(reason) < 3:
         await message.answer("Sabab juda qisqa. Iltimos, batafsilroq yozing.")
         return
 
     data = await state.get_data()
+    await ask_fine_amount(message, state, data["tg_id"], reason)
+
+
+@panel_router.message(GiveFine.amount, F.text)
+async def fine_amount_written(message: Message, state: FSMContext):
+    amount = parse_number(message.text)
+    if amount is None or amount <= 0:
+        await message.answer(
+            "🙈 Summani faqat raqam bilan yozing, masalan: <i>50000</i>",
+        )
+        return
+    if amount > MARK_MAX_AMOUNT:
+        await message.answer(
+            f"🙈 Summa juda katta. Eng ko'pi {format_money(MARK_MAX_AMOUNT)} bo'lishi mumkin — "
+            "raqamni tekshirib qaytadan yozing."
+        )
+        return
+
+    data = await state.get_data()
     await state.clear()
-    await save_and_notify_mark(message, message.from_user, data["tg_id"], "jazo", reason)
+    await save_and_notify_mark(
+        message, message.from_user, data["tg_id"], "jarima", data["reason"], amount
+    )
 
 
-# ---------- Ish joyi lokatsiyasi va radius ----------
+# ---------- Ish joyi joylashuvi va radius ----------
 # Ishchilar "juda uzoqdasiz" degan javob olayotgan bo'lsa, ko'pincha sabab —
 # config.py dagi koordinata bino ustiga aniq tushmagan. Admin ish joyi ichida
 # turib jonli joylashuv yuborsa, nuqta shu yerga ko'chadi.
 
 CENTER_KB = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Yangi ish joyini belgilash", callback_data="center_set")],
+        [InlineKeyboardButton(text="🎯 Yangi nuqtani belgilash", callback_data="center_set")],
         [InlineKeyboardButton(text="📏 Radiusni o'zgartirish", callback_data="center_radius")],
     ]
 )
 
 
-@panel_router.message(F.text == "📍 Ish joyi lokatsiyasi")
+@panel_router.message(F.text == "📍 Ish joyi joylashuvi")
 async def center_menu(message: Message):
     lat, lon = get_center()
     is_custom = get_setting("center_lat") is not None
@@ -2132,7 +2326,7 @@ def pdf_text(value, unicode_font: bool) -> str:
 
 
 def build_report_pdf(records, marks, date_from, date_to) -> bytes:
-    """Davomat va bonus/jazolardan PDF yasaydi."""
+    """Davomat, bonus, jarima (sabab va summa bilan) va ogohlantirishlardan PDF yasaydi."""
     pdf = FPDF(orientation="P", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     font, unicode_font = setup_pdf_font(pdf)
@@ -2172,7 +2366,7 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
     # ---- 1-jadval: har bir ishchi bo'yicha yakun ----
     def new_item():
         return {"days": 0, "late": 0, "minutes": 0, "fine": 0,
-                "bonus": 0, "jazo": 0, "ogohlantirish": 0}
+                "bonus": 0, "jarima": 0, "ogohlantirish": 0, "bonus_sum": 0}
 
     summary: dict[str, dict] = {}
     for first, last, _date, _arrived, _sched, is_late, late_min, _early, fine, _left in records:
@@ -2182,28 +2376,38 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
         if is_late:
             item["late"] += 1
             item["minutes"] += late_min
-    for first, last, mark_type, _reason, _amount, _date in marks:
+    for first, last, mark_type, _reason, _date, amount in marks:
         item = summary.setdefault(f"{first} {last}", new_item())
-        item[mark_type] += 1
+        if mark_type in item:
+            item[mark_type] += 1
+        if mark_type == "jarima":
+            item["fine"] += amount  # jami jarimaga admin bergan jarimalar ham qo'shiladi
+        elif mark_type == "bonus":
+            item["bonus_sum"] += amount
+
     total_fine_all = sum(item["fine"] for item in summary.values())
+    total_bonus_all = sum(item["bonus_sum"] for item in summary.values())
 
     pdf.set_font(font, "B", 12)
     pdf.cell(0, 8, safe("1. Umumiy yakun"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     table(
-        ["Ishchi", "Kelgan", "Kech kun", "Jami jarima", "Bonus", "Jazo", "Ogoh."],
+        ["Ishchi", "Kelgan", "Kech kun", "Jami jarima", "Jami bonus", "Bonus", "Jarima", "Ogoh."],
         [
             [name, item["days"], item["late"],
              format_money(item["fine"]) if item["fine"] else "-",
-             item["bonus"], item["jazo"], item["ogohlantirish"]]
+             format_money(item["bonus_sum"]) if item["bonus_sum"] else "-",
+             item["bonus"], item["jarima"], item["ogohlantirish"]]
             for name, item in sorted(summary.items())
         ],
-        widths=(50, 20, 22, 42, 16, 16, 20),
-        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "CENTER", "CENTER", "CENTER"),
+        widths=(38, 16, 18, 34, 34, 14, 16, 14),
+        aligns=("LEFT", "CENTER", "CENTER", "RIGHT", "RIGHT", "CENTER", "CENTER", "CENTER"),
     )
     pdf.ln(2)
     pdf.set_font(font, "B", 10)
     pdf.cell(0, 7, safe(f"Barcha ishchilar bo'yicha jami jarima: {format_money(total_fine_all)}"),
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 7, safe(f"Barcha ishchilar bo'yicha jami bonus: {format_money(total_bonus_all)}"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(4)
 
@@ -2236,29 +2440,26 @@ def build_report_pdf(records, marks, date_from, date_to) -> bytes:
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(6)
 
-    # ---- 3-jadval: bonus, jazo va ogohlantirishlar, sabablari bilan ----
-    type_label = {"bonus": "BONUS", "jazo": "JAZO", "ogohlantirish": "OGOHLANTIRISH"}
+    # ---- 3-jadval: bonus, jarima va ogohlantirishlar, sabab va summalari bilan ----
+    type_label = {"bonus": "BONUS", "jarima": "JARIMA", "ogohlantirish": "OGOHLANTIRISH"}
     pdf.set_font(font, "B", 12)
-    pdf.cell(0, 8, safe("3. Bonus, jazo va ogohlantirishlar"),
+    pdf.cell(0, 8, safe("3. Bonus, jarima va ogohlantirishlar"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(font, "", 9)
     if marks:
         table(
-            ["Ishchi", "Sana", "Turi", "Sababi"],
+            ["Ishchi", "Sana", "Turi", "Sababi", "Summa"],
             [
-                [
-                    f"{first} {last}", date, type_label.get(mark_type, mark_type.upper()),
-                    reason + (f" — {format_money(amount)}" if amount else ""),
-                ]
-                for first, last, mark_type, reason, amount, date in marks
+                [f"{first} {last}", date, type_label.get(mark_type, mark_type.upper()), reason,
+                 format_money(amount) if mark_type in ("bonus", "jarima") and amount else "-"]
+                for first, last, mark_type, reason, date, amount in marks
             ],
-            widths=(40, 22, 30, 88),
-            aligns=("LEFT", "CENTER", "CENTER", "LEFT"),
+            widths=(36, 22, 26, 72, 28),
+            aligns=("LEFT", "CENTER", "CENTER", "LEFT", "RIGHT"),
         )
     else:
-        pdf.cell(0, 6, safe("Bu davrda bonus, jazo yoki ogohlantirish berilmagan."),
+        pdf.cell(0, 6, safe("Bu davrda bonus, jarima yoki ogohlantirish berilmagan."),
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
     return bytes(pdf.output())
 
 
@@ -2270,7 +2471,7 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
                COALESCE(a.scheduled_time, t.scheduled_time), a.is_late, a.late_minutes,
                a.early_minutes, a.fine_amount, a.left_time
         FROM attendance a
-        JOIN employees t ON t.id = a.employee_id
+        JOIN workers t ON t.id = a.worker_id
         WHERE a.attendance_date BETWEEN ? AND ?
         ORDER BY a.attendance_date, t.first_name, t.last_name
         """,
@@ -2278,9 +2479,9 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
     )
     marks = db(
         """
-        SELECT t.first_name, t.last_name, m.mark_type, m.reason, m.amount, m.mark_date
+        SELECT t.first_name, t.last_name, m.mark_type, m.reason, m.mark_date, m.amount
         FROM marks m
-        JOIN employees t ON t.id = m.employee_id
+        JOIN workers t ON t.id = m.worker_id
         WHERE m.mark_date BETWEEN ? AND ?
         ORDER BY m.mark_date, t.first_name, t.last_name
         """,
@@ -2290,23 +2491,27 @@ async def send_pdf_report(message: Message, date_from, date_to) -> None:
     if not records and not marks:
         await message.answer(
             f"{date_from.isoformat()} — {date_to.isoformat()} oralig'ida "
-            "davomat, bonus yoki jazo yozuvi topilmadi."
+            "davomat, bonus yoki jarima yozuvi topilmadi."
         )
         return
 
     pdf_bytes = build_report_pdf(records, marks, date_from, date_to)
-    bonus_count = sum(1 for _, _, mark_type, _, _, _ in marks if mark_type == "bonus")
-    jazo_count = sum(1 for _, _, mark_type, _, _, _ in marks if mark_type == "jazo")
-    ogoh_count = sum(1 for _, _, mark_type, _, _, _ in marks if mark_type == "ogohlantirish")
-    total_fine = sum(row[8] for row in records)
+    bonus_count = sum(1 for m in marks if m[2] == "bonus")
+    fine_count = sum(1 for m in marks if m[2] == "jarima")
+    ogoh_count = sum(1 for m in marks if m[2] == "ogohlantirish")
+    # Jami jarima = kechikish jarimalari + admin bergan jarimalar
+    total_fine = sum(row[8] for row in records) + sum(m[5] for m in marks if m[2] == "jarima")
+    total_bonus = sum(m[5] for m in marks if m[2] == "bonus")
 
     caption = (
         f"📄 Davomat hisoboti\n"
         f"Davr: {date_from.isoformat()} — {date_to.isoformat()}\n"
         f"📊 Davomat yozuvlari: {len(records)}\n"
         f"💰 Jami jarima: {format_money(total_fine)}\n"
-        f"🏅 Bonuslar: {bonus_count}   ⚠️ Jazolar: {jazo_count}   🔔 Ogohlantirishlar: {ogoh_count}"
+        f"🏅 Jami bonus: {format_money(total_bonus)}\n"
+        f"🏅 Bonuslar: {bonus_count}   💸 Berilgan jarimalar: {fine_count}   🔔 Ogohlantirishlar: {ogoh_count}"
     )
+
     await message.answer_document(
         BufferedInputFile(
             pdf_bytes,
@@ -2491,17 +2696,17 @@ async def fine_edit_save(message: Message, state: FSMContext):
 # ==================== 8. ADMIN BUYRUQLARI (eski, ixtiyoriy) ====================
 # Tugmalar o'rniga matnli buyruqlarni yoqtirganlar uchun saqlab qolingan.
 
-@admin_router.message(Command("add_employee"))
-async def cmd_add_employee(message: Message):
+@admin_router.message(Command("add_worker"))
+async def cmd_add_worker(message: Message):
     if not is_admin(message.from_user):
         return
 
-    # Format: /add_employee <telegram_id> <Ism> <Familiya> <HH:MM>
+    # Format: /add_worker <telegram_id> <Ism> <Familiya> <HH:MM>
     parts = message.text.split(maxsplit=4)
     if len(parts) != 5:
         await message.answer(
-            "Foydalanish: /add_employee <telegram_id> <Ism> <Familiya> <HH:MM>\n"
-            "Masalan: /add_employee 123456789 Ali Valiyev 09:00\n\n"
+            "Foydalanish: /add_worker <telegram_id> <Ism> <Familiya> <HH:MM>\n"
+            "Masalan: /add_worker 123456789 Ali Valiyev 09:00\n\n"
             "💡 Osonroq yo'l: \"➕ Ishchi qo'shish\" tugmasini bosing."
         )
         return
@@ -2514,7 +2719,7 @@ async def cmd_add_employee(message: Message):
         await message.answer("Vaqt HH:MM formatida bo'lishi kerak, masalan: 09:00")
         return
 
-    if add_employee(int(tg_id), first_name, last_name, sched_time):
+    if add_worker(int(tg_id), first_name, last_name, sched_time):
         await message.answer(
             f"✅ Qo'shildi: {first_name} {last_name} (belgilangan vaqt: {sched_time})"
         )
@@ -2522,17 +2727,17 @@ async def cmd_add_employee(message: Message):
         await message.answer("⚠️ Bu telegram_id bilan ishchi allaqachon mavjud.")
 
 
-@admin_router.message(Command("remove_employee"))
-async def cmd_remove_employee(message: Message):
+@admin_router.message(Command("remove_worker"))
+async def cmd_remove_worker(message: Message):
     if not is_admin(message.from_user):
         return
 
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Foydalanish: /remove_employee <telegram_id>")
+        await message.answer("Foydalanish: /remove_worker <telegram_id>")
         return
 
-    ok = db("DELETE FROM employees WHERE telegram_id = ?", (int(parts[1]),)) > 0
+    ok = db("DELETE FROM workers WHERE telegram_id = ?", (int(parts[1]),)) > 0
     await message.answer("✅ O'chirildi." if ok else "⚠️ Bunday ishchi topilmadi.")
 
 
@@ -2550,28 +2755,28 @@ async def cmd_set_time(message: Message):
         return
 
     ok = db(
-        "UPDATE employees SET scheduled_time = ? WHERE telegram_id = ?",
+        "UPDATE workers SET scheduled_time = ? WHERE telegram_id = ?",
         (parts[2], int(parts[1])),
     ) > 0
     await message.answer(f"✅ Yangilandi: {parts[2]}" if ok else "⚠️ Bunday ishchi topilmadi.")
 
 
-@admin_router.message(Command("list_employees"))
-async def cmd_list_employees(message: Message):
+@admin_router.message(Command("list_workers"))
+async def cmd_list_workers(message: Message):
     if not is_admin(message.from_user):
         return
 
-    employees = db(
+    workers = db(
         "SELECT first_name, last_name, scheduled_time, departure_time, telegram_id "
-        "FROM employees", fetch="all",
+        "FROM workers", fetch="all",
     )
-    if not employees:
+    if not workers:
         await message.answer("Hozircha ishchilar ro'yxati bo'sh.")
         return
 
     lines = ["📋 Ishchilar ro'yxati:\n"] + [
         f"• {first} {last} — {sched} dan {departure} gacha (ID: {tg_id})"
-        for first, last, sched, departure, tg_id in employees
+        for first, last, sched, departure, tg_id in workers
     ]
     await message.answer("\n".join(lines))
 
@@ -2614,11 +2819,10 @@ async def cmd_pdf_report(message: Message):
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
-    log_db_diagnostics()
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-    dp.include_routers(admin_router, panel_router, employee_router)
+    dp.include_routers(admin_router, panel_router, worker_router)
 
     await bot.delete_webhook(drop_pending_updates=True)
 
