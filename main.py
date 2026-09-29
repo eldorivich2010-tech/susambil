@@ -46,7 +46,7 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 from fpdf.fonts import FontFace
 
-from susambil.config import (
+from config import (
     ADMIN_IDS,
     BOT_TOKEN,
     CENTER_LATITUDE,
